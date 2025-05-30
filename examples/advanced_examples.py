@@ -1,6 +1,6 @@
+# examples/advanced_examples.py
 """
-Practical example demonstrating the PyTorch Dynamic Scaling Framework
-This example shows how to use the framework to run models larger than GPU memory
+Advanced examples demonstrating various features of Overflow
 """
 
 import torch
@@ -10,50 +10,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import time
 from typing import Optional
 
-# Import our framework (in practice, this would be: from pytorch_dynamic_scaling import DynamicMemoryModule)
-# For this example, assume the framework is available
-
-
-class SimpleUsageExample:
-    """Demonstrates the simplicity of using the framework."""
-    
-    @staticmethod
-    def standard_pytorch():
-        """Standard PyTorch code that might OOM on large models."""
-        # Create a large model
-        model = nn.Sequential(
-            nn.Linear(10000, 5000),
-            nn.ReLU(),
-            nn.Linear(5000, 5000),
-            nn.ReLU(),
-            nn.Linear(5000, 1000),
-        )
-        
-        # This might fail with OOM on smaller GPUs
-        model = model.cuda()
-        x = torch.randn(32, 10000).cuda()
-        output = model(x)
-        return output
-    
-    @staticmethod
-    def with_dynamic_scaling():
-        """Same code but with automatic memory management."""
-        # Create the same large model
-        model = nn.Sequential(
-            nn.Linear(10000, 5000),
-            nn.ReLU(),
-            nn.Linear(5000, 5000),
-            nn.ReLU(),
-            nn.Linear(5000, 1000),
-        )
-        
-        # Wrap with DynamicMemoryModule - that's it!
-        model = DynamicMemoryModule(model)
-        
-        # Use exactly like normal PyTorch
-        x = torch.randn(32, 10000)
-        output = model(x)
-        return output
+from overflow import DynamicMemoryModule, MemoryConfig, ExecutionStrategy
 
 
 class TransformerExample:
@@ -106,7 +63,7 @@ class TransformerExample:
         """Run inference with or without the wrapper."""
         print(f"\n{'='*50}")
         print(f"Running {self.model_size} transformer model")
-        print(f"Wrapper enabled: {use_wrapper}")
+        print(f"Overflow enabled: {use_wrapper}")
         print(f"{'='*50}\n")
         
         # Optionally wrap the model
@@ -163,7 +120,7 @@ class TransformerExample:
         except RuntimeError as e:
             if "out of memory" in str(e):
                 print(f"✗ Out of memory error!")
-                print(f"  This model is too large for available GPU memory without the wrapper.")
+                print(f"  This model is too large for available GPU memory without Overflow.")
             else:
                 raise e
     
@@ -226,67 +183,13 @@ class TransformerExample:
         print(f"  Strategy used: {stats['strategy']}")
 
 
-class ComparisonDemo:
-    """Demonstrates the framework with different model sizes."""
-    
-    @staticmethod
-    def run_all_demos():
-        """Run demonstrations with different model sizes."""
-        print("PyTorch Dynamic Scaling Framework Demo")
-        print("=====================================\n")
-        
-        # 1. Simple usage example
-        print("1. Simple Usage Example")
-        print("-----------------------")
-        print("Standard PyTorch:")
-        print("```python")
-        print("model = create_large_model()")
-        print("model = model.cuda()  # Might OOM!")
-        print("output = model(input)")
-        print("```")
-        
-        print("\nWith DynamicMemoryModule:")
-        print("```python")
-        print("model = create_large_model()")
-        print("model = DynamicMemoryModule(model)  # Automatic memory management")
-        print("output = model(input)  # Just works!")
-        print("```")
-        
-        # 2. Run inference examples
-        print("\n\n2. Inference Examples")
-        print("---------------------")
-        
-        # Small model - should work without wrapper
-        small_example = TransformerExample("small")
-        small_example.run_inference(use_wrapper=False)
-        small_example.run_inference(use_wrapper=True)
-        
-        # Large model - might need wrapper depending on GPU
-        large_example = TransformerExample("large")
-        large_example.run_inference(use_wrapper=True)
-        
-        # 3. Training example
-        print("\n\n3. Training Example")
-        print("-------------------")
-        training_example = TransformerExample("large")
-        training_example.run_training_loop(num_steps=5)
-        
-        print("\n\nDemo complete! The framework automatically:")
-        print("✓ Detects available hardware")
-        print("✓ Profiles memory usage") 
-        print("✓ Selects optimal execution strategy")
-        print("✓ Handles models larger than GPU memory")
-        print("✓ Maintains standard PyTorch API")
-
-
-# Advanced features demonstration
 class AdvancedFeatures:
     """Demonstrates advanced features of the framework."""
     
     @staticmethod
     def custom_config_example():
         """Show how to use custom configuration."""
-        from pytorch_dynamic_scaling import MemoryConfig
+        print("\n=== Custom Configuration Example ===")
         
         # Custom configuration
         config = MemoryConfig(
@@ -297,24 +200,42 @@ class AdvancedFeatures:
         )
         
         # Create model with custom config
-        model = create_large_model()
-        model = DynamicMemoryModule(model, config=config)
+        model = nn.Sequential(
+            nn.Linear(1000, 2000),
+            nn.ReLU(),
+            nn.Linear(2000, 1000)
+        )
+        wrapped = DynamicMemoryModule(model, config=config)
         
-        return model
+        print(f"Custom configuration applied:")
+        print(f"  Checkpoint threshold: {config.checkpoint_threshold:.0%}")
+        print(f"  Offload threshold: {config.offload_threshold:.0%}")
+        print(f"  Strategy: {wrapped.strategy.value}")
+        
+        return wrapped
     
     @staticmethod
     def mixed_precision_example():
         """Demonstrate compatibility with mixed precision training."""
+        print("\n=== Mixed Precision Training Example ===")
+        
+        if not torch.cuda.is_available():
+            print("CUDA not available - skipping mixed precision example")
+            return
+        
         from torch.cuda.amp import autocast, GradScaler
         
-        model = create_large_model()
+        model = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=512, nhead=8),
+            num_layers=6
+        )
         model = DynamicMemoryModule(model)
         
         optimizer = optim.Adam(model.parameters())
         scaler = GradScaler()
         
         # Training step with mixed precision
-        inputs = torch.randn(4, 128)
+        inputs = torch.randn(10, 32, 512).cuda()  # seq_len, batch, d_model
         
         with autocast():
             outputs = model(inputs)
@@ -324,13 +245,17 @@ class AdvancedFeatures:
         scaler.step(optimizer)
         scaler.update()
         
-        print("Mixed precision training works seamlessly!")
+        print("✓ Mixed precision training works seamlessly with Overflow!")
+        print(f"  Strategy: {model.strategy.value}")
+        print(f"  Loss: {loss.item():.4f}")
     
     @staticmethod
     def multi_gpu_example():
         """Demonstrate multi-GPU model parallelism."""
+        print("\n=== Multi-GPU Example ===")
+        
         if torch.cuda.device_count() < 2:
-            print("Multi-GPU example requires 2+ GPUs")
+            print("Multi-GPU example requires 2+ GPUs - skipping")
             return
         
         # Create a very large model
@@ -345,21 +270,85 @@ class AdvancedFeatures:
         # Wrap with framework - automatically uses model parallelism
         model = DynamicMemoryModule(model)
         
-        print(f"Model distributed across {torch.cuda.device_count()} GPUs")
-        print(f"Using strategy: {model.strategy.value}")
+        print(f"✓ Model distributed across {torch.cuda.device_count()} GPUs")
+        print(f"  Using strategy: {model.strategy.value}")
+        
+        # Test forward pass
+        x = torch.randn(32, 10000)
+        output = model(x)
+        print(f"  Output shape: {output.shape}")
+    
+    @staticmethod
+    def memory_profiling_example():
+        """Demonstrate detailed memory profiling."""
+        print("\n=== Memory Profiling Example ===")
+        
+        # Create model with profiling enabled
+        config = MemoryConfig(
+            enable_profiling=True,
+            profile_interval=1  # Profile every forward pass
+        )
+        
+        model = nn.Sequential(
+            nn.Linear(1000, 2000),
+            nn.ReLU(),
+            nn.Linear(2000, 3000),
+            nn.ReLU(),
+            nn.Linear(3000, 1000)
+        )
+        model = DynamicMemoryModule(model, config=config)
+        
+        # Run several forward passes
+        for i in range(5):
+            x = torch.randn(64, 1000)
+            _ = model(x)
+        
+        # Get detailed statistics
+        stats = model.get_memory_stats()
+        
+        print("Memory usage by module:")
+        for name, module_stats in stats['module_stats'].items():
+            if module_stats['count'] > 0:
+                avg_memory = module_stats['total_memory'] / module_stats['count']
+                print(f"  {name}:")
+                print(f"    Average: {avg_memory:.2f} MB")
+                print(f"    Peak: {module_stats['peak_memory']:.2f} MB")
+        
+        print(f"\nOverall peak memory: {stats['peak_memory_mb']:.2f} MB")
 
 
-def create_large_model() -> nn.Module:
-    """Helper function to create a large model for examples."""
-    return nn.Sequential(
-        nn.Linear(10000, 5000),
-        nn.ReLU(),
-        nn.Linear(5000, 5000),
-        nn.ReLU(),
-        nn.Linear(5000, 1000),
-    )
+def run_all_examples():
+    """Run all advanced examples."""
+    print("Overflow: Advanced Examples")
+    print("=" * 60)
+    
+    # 1. Transformer examples
+    print("\n1. Transformer Model Examples")
+    print("-" * 30)
+    
+    # Small model
+    small_example = TransformerExample("small")
+    small_example.run_inference()
+    
+    # Large model (if enough memory)
+    try:
+        large_example = TransformerExample("large")
+        large_example.run_inference()
+        large_example.run_training_loop(num_steps=3)
+    except Exception as e:
+        print(f"Large model example failed: {e}")
+    
+    # 2. Advanced features
+    print("\n\n2. Advanced Features")
+    print("-" * 30)
+    
+    AdvancedFeatures.custom_config_example()
+    AdvancedFeatures.mixed_precision_example()
+    AdvancedFeatures.multi_gpu_example()
+    AdvancedFeatures.memory_profiling_example()
+    
+    print("\n\nAll examples completed!")
 
 
 if __name__ == "__main__":
-    # Run the demonstration
-    ComparisonDemo.run_all_demos()
+    run_all_examples()

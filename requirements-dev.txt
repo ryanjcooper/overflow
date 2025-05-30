@@ -1,0 +1,18 @@
+# requirements-dev.txt
+# Core dependencies
+-r requirements.txt
+
+# Testing
+pytest>=6.0
+pytest-cov>=2.0
+
+# Code quality
+black>=21.0
+flake8>=3.9
+mypy>=0.910
+isort>=5.9
+
+# Documentation
+sphinx>=4.0
+sphinx-rtd-theme>=0.5
+sphinx-autodoc-typehints>=1.12

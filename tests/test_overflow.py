@@ -1,6 +1,7 @@
+# tests/test_overflow.py
 """
-Unit tests for PyTorch Dynamic Scaling Framework
-Run with: python -m pytest test_dynamic_scaling.py -v
+Unit tests for Overflow package
+Run with: python -m pytest tests/test_overflow.py -v
 """
 
 import pytest
@@ -10,8 +11,8 @@ import gc
 from unittest.mock import Mock, patch
 import psutil
 
-# Import framework components (adjust path as needed)
-from pytorch_dynamic_scaling import (
+# Import framework components
+from overflow import (
     DynamicMemoryModule, 
     MemoryConfig, 
     ExecutionStrategy,

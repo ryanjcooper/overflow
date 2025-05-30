@@ -1,6 +1,7 @@
-# PyTorch Dynamic Scaling Framework
+# README.md
+# Overflow: When your model overflows the GPU
 
-A hardware abstraction layer for PyTorch that enables running models larger than available memory through intelligent memory management, automatic model partitioning, and dynamic execution strategies.
+A PyTorch memory management framework that enables running models larger than available GPU memory through intelligent memory management, automatic model partitioning, and dynamic execution strategies.
 
 ## Features
 
@@ -16,8 +17,8 @@ A hardware abstraction layer for PyTorch that enables running models larger than
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/pytorch-dynamic-scaling.git
-cd pytorch-dynamic-scaling
+git clone https://github.com/yourusername/overflow.git
+cd overflow
 
 # Install dependencies
 pip install torch psutil
@@ -29,19 +30,19 @@ pip install -e .
 ## Quick Start
 
 ```python
-from pytorch_dynamic_scaling import DynamicMemoryModule
+from overflow import DynamicMemoryModule
 
 # Your existing PyTorch model
 model = create_your_large_model()
 
-# Wrap it with DynamicMemoryModule
+# Wrap it with Overflow
 model = DynamicMemoryModule(model)
 
 # Use it exactly like a normal PyTorch model
 output = model(input_tensor)
 ```
 
-That's it! The framework automatically:
+That's it! Overflow automatically:
 - Detects available hardware
 - Estimates model memory requirements
 - Selects the optimal execution strategy
@@ -52,7 +53,7 @@ That's it! The framework automatically:
 ```python
 import torch
 import torch.nn as nn
-from pytorch_dynamic_scaling import DynamicMemoryModule
+from overflow import DynamicMemoryModule
 
 # Create a large transformer model (40GB+)
 model = nn.TransformerEncoder(
@@ -60,7 +61,7 @@ model = nn.TransformerEncoder(
     num_layers=48
 )
 
-# Wrap with dynamic memory management
+# Wrap with Overflow
 model = DynamicMemoryModule(model)
 
 # The framework automatically enables CPU offloading
@@ -73,7 +74,7 @@ output = model(input_tensor)
 
 ## Execution Strategies
 
-The framework automatically selects the best strategy based on your hardware:
+Overflow automatically selects the best strategy based on your hardware:
 
 | Strategy | When Used | Description |
 |----------|-----------|-------------|
@@ -86,7 +87,7 @@ The framework automatically selects the best strategy based on your hardware:
 ## Custom Configuration
 
 ```python
-from pytorch_dynamic_scaling import DynamicMemoryModule, MemoryConfig
+from overflow import DynamicMemoryModule, MemoryConfig
 
 # Customize memory management behavior
 config = MemoryConfig(
@@ -160,7 +161,7 @@ scaler.update()
 ### Manual Strategy Selection
 
 ```python
-from pytorch_dynamic_scaling import ExecutionStrategy
+from overflow import ExecutionStrategy
 
 # Force a specific strategy
 model = DynamicMemoryModule(
@@ -171,7 +172,7 @@ model = DynamicMemoryModule(
 
 ### Integration with Existing Code
 
-The framework maintains full compatibility with PyTorch:
+Overflow maintains full compatibility with PyTorch:
 
 ```python
 # Works with all PyTorch features
@@ -243,14 +244,14 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 
 ## Citation
 
-If you use this framework in your research, please cite:
+If you use Overflow in your research, please cite:
 
 ```bibtex
-@software{pytorch_dynamic_scaling,
-  title = {PyTorch Dynamic Scaling Framework},
+@software{overflow,
+  title = {Overflow: When your model overflows the GPU},
   author = {Your Name},
   year = {2024},
-  url = {https://github.com/yourusername/pytorch-dynamic-scaling}
+  url = {https://github.com/yourusername/overflow}
 }
 ```
 

@@ -1,5 +1,6 @@
+# src/overflow/__init__.py
 """
-PyTorch Dynamic Scaling Framework
+Overflow: When your model overflows the GPU
 A hardware abstraction layer for running large models on limited memory systems
 """
 
@@ -16,6 +17,18 @@ from collections import OrderedDict
 import threading
 import queue
 import time
+
+__version__ = "0.1.0"
+__all__ = [
+    "DynamicMemoryModule", 
+    "MemoryConfig", 
+    "ExecutionStrategy",
+    "MemoryProfiler",
+    "DeviceManager",
+    "BlockSwapManager",
+    "ModelPartitioner",
+    "DeviceInfo"
+]
 
 
 class ExecutionStrategy(Enum):
@@ -421,71 +434,3 @@ class DynamicMemoryModule(nn.Module):
                 for d in self.device_manager.devices
             ]
         }
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Create a large model for testing
-    class LargeTransformer(nn.Module):
-        def __init__(self, vocab_size=50000, d_model=1024, nhead=16, num_layers=24):
-            super().__init__()
-            self.embedding = nn.Embedding(vocab_size, d_model)
-            self.transformer = nn.TransformerEncoder(
-                nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=4096),
-                num_layers=num_layers
-            )
-            self.output_proj = nn.Linear(d_model, vocab_size)
-        
-        def forward(self, x):
-            x = self.embedding(x)
-            x = self.transformer(x)
-            x = self.output_proj(x)
-            return x
-    
-    # Create model
-    print("Creating large model...")
-    model = LargeTransformer()
-    
-    # Wrap with dynamic memory management
-    print("\nWrapping with DynamicMemoryModule...")
-    wrapped_model = DynamicMemoryModule(model)
-    
-    # Print detected strategy
-    print(f"\nDetected execution strategy: {wrapped_model.strategy.value}")
-    print(f"Model size: {wrapped_model._estimate_model_size() / 1024**3:.2f} GB")
-    
-    # Test forward pass
-    print("\nTesting forward pass...")
-    try:
-        # Create dummy input
-        batch_size, seq_len = 2, 128
-        input_ids = torch.randint(0, 50000, (batch_size, seq_len))
-        
-        # Move to appropriate device
-        device = wrapped_model.device_manager.primary_device
-        input_ids = input_ids.to(device)
-        wrapped_model = wrapped_model.to(device)
-        
-        # Forward pass
-        output = wrapped_model(input_ids)
-        print(f"Output shape: {output.shape}")
-        
-        # Get memory stats
-        stats = wrapped_model.get_memory_stats()
-        print(f"\nMemory Statistics:")
-        print(f"Strategy: {stats['strategy']}")
-        print(f"Peak memory: {stats['peak_memory_mb']:.2f} MB")
-        
-        print(f"\nDevice Information:")
-        for device_info in stats['devices']:
-            print(f"  {device_info['name']} ({device_info['type']}): "
-                  f"{device_info['available_memory_mb']:.0f}/{device_info['total_memory_mb']:.0f} MB available")
-        
-    except Exception as e:
-        print(f"Error during forward pass: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Cleanup
-    if hasattr(wrapped_model, 'swap_manager'):
-        wrapped_model.swap_manager.stop()
