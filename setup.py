@@ -11,12 +11,12 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setup(
     name="overflow",
     version="0.1.0",
-    author="Your Name",
-    author_email="your.email@example.com",
+    author="Ryan Cooper",
+    author_email="rjcooper@live.com",
     description="When your model overflows the GPU - A PyTorch memory management framework",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/overflow",
+    url="https://github.com/ryanjcooper/overflow",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     classifiers=[

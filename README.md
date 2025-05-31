@@ -1,28 +1,20 @@
-# Overflow: When your model overflows the GPU
+# Overflow
 
-A PyTorch memory management framework that enables running models larger than available GPU memory through intelligent memory management, automatic model partitioning, and dynamic execution strategies.
+A PyTorch memory management framework that automatically handles models larger than GPU memory.
 
 ## Features
 
-- **Automatic Memory Management**: Intelligently handles models that exceed GPU memory
-- **Multiple Execution Strategies**: Automatically selects between standard execution, gradient checkpointing, model parallelism, and CPU offloading
-- **Simple API**: Drop-in replacement for `nn.Module` - just wrap your model
-- **Hardware Detection**: Automatically profiles available GPUs and system memory
-- **Memory Profiling**: Built-in profiling to track memory usage per module
-- **Block Swapping**: Efficient tensor swapping between GPU and CPU memory
-- **Multi-GPU Support**: Automatic model parallelism across available GPUs
+- **Simple API**: Just wrap your model with `DynamicMemoryModule`
+- **Automatic Strategy Selection**: Chooses optimal execution based on available hardware
+- **Multi-GPU Support**: Data parallel and model parallel execution
+- **Memory Profiling**: Track memory usage per module
+- **CPU Offloading**: Run models larger than total GPU memory
 
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/overflow.git
+git clone https://github.com/ryanjcooper/overflow.git
 cd overflow
-
-# Install dependencies
-pip install torch psutil
-
-# Install the package
 pip install -e .
 ```
 
@@ -31,30 +23,23 @@ pip install -e .
 ```python
 from overflow import DynamicMemoryModule
 
-# Your existing PyTorch model
-model = create_your_large_model()
+# Wrap your model
+model = DynamicMemoryModule(your_model)
 
-# Wrap it with Overflow
-model = DynamicMemoryModule(model)
-
-# Use it exactly like a normal PyTorch model
+# Use normally
 output = model(input_tensor)
 ```
 
-That's it! Overflow automatically:
-- Detects available hardware
-- Estimates model memory requirements
-- Selects the optimal execution strategy
-- Manages memory during forward and backward passes
+Overflow automatically handles everything else.
 
-## Example: Running a 40GB Model on 16GB GPU
+## Example
 
 ```python
 import torch
 import torch.nn as nn
 from overflow import DynamicMemoryModule
 
-# Create a large transformer model (40GB+)
+# Create a large transformer model
 model = nn.TransformerEncoder(
     nn.TransformerEncoderLayer(d_model=2048, nhead=32, dim_feedforward=8192),
     num_layers=48
@@ -63,10 +48,10 @@ model = nn.TransformerEncoder(
 # Wrap with Overflow
 model = DynamicMemoryModule(model)
 
-# The framework automatically enables CPU offloading
-print(f"Execution strategy: {model.strategy}")  # Output: "cpu_offload"
+# The framework automatically selects the best strategy
+print(f"Execution strategy: {model.strategy}")
 
-# Run inference - works even though model > GPU memory!
+# Run inference normally
 input_tensor = torch.randn(16, 512, 2048)
 output = model(input_tensor)
 ```
@@ -80,10 +65,9 @@ Overflow automatically selects the best strategy based on your hardware:
 |----------|-----------|-------------|
 | **Standard** | Model fits comfortably in GPU memory | Normal PyTorch execution |
 | **Gradient Checkpoint** | Model fits but activations don't | Trades compute for memory by recomputing activations |
-| **Data Parallel** | Model fits on one GPU + multiple GPUs available | Splits batch across GPUs for faster inference |
+| **Data Parallel** | Small model + multiple GPUs + large batch | Splits batch across GPUs |
 | **Model Parallel** | Model too large for one GPU but fits across all | Distributes model layers across GPUs |
-| **CPU Offload** | Model exceeds total GPU memory | Dynamically swaps layers between CPU and GPU(s) |
-| **Hybrid** | Complex scenarios | Combines multiple strategies |
+| **CPU Offload** | Model exceeds total GPU memory | Dynamically swaps layers between CPU and GPU |
 
 ### Strategy Selection Logic
 
@@ -190,18 +174,6 @@ scaler.step(optimizer)
 scaler.update()
 ```
 
-### Manual Strategy Selection
-
-```python
-from overflow import ExecutionStrategy
-
-# Force a specific strategy
-model = DynamicMemoryModule(
-    your_model,
-    force_strategy=ExecutionStrategy.CPU_OFFLOAD
-)
-```
-
 ### Integration with Existing Code
 
 Overflow maintains full compatibility with PyTorch:
@@ -263,7 +235,7 @@ If you still get OOM errors:
 
 ## Contributing
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+We welcome contributions! Please submit issues and pull requests on GitHub.
 
 ## Roadmap
 
@@ -281,12 +253,12 @@ If you use Overflow in your research, please cite:
 ```bibtex
 @software{overflow,
   title = {Overflow: When your model overflows the GPU},
-  author = {Your Name},
-  year = {2024},
-  url = {https://github.com/yourusername/overflow}
+  author = {Ryan Cooper},
+  year = {2025},
+  url = {https://github.com/ryanjcooper/overflow}
 }
 ```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.

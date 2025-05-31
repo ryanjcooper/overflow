@@ -11,10 +11,10 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "Your Name", email = "your.email@example.com"},
+    {name = "Ryan Cooper", email = "rjcooper@live.com"},
 ]
 maintainers = [
-    {name = "Your Name", email = "your.email@example.com"},
+    {name = "Ryan Cooper", email = "rjcooper@live.com"},
 ]
 keywords = [
     "pytorch",
@@ -62,10 +62,10 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/overflow"
+Homepage = "https://github.com/ryanjcooper/overflow"
 Documentation = "https://overflow.readthedocs.io"
-Repository = "https://github.com/yourusername/overflow"
-"Bug Tracker" = "https://github.com/yourusername/overflow/issues"
+Repository = "https://github.com/ryanjcooper/overflow"
+"Bug Tracker" = "https://github.com/ryanjcooper/overflow/issues"
 
 [project.scripts]
 overflow-info = "overflow.cli:main"
