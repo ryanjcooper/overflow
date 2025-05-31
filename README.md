@@ -1,4 +1,3 @@
-# README.md
 # Overflow: When your model overflows the GPU
 
 A PyTorch memory management framework that enables running models larger than available GPU memory through intelligent memory management, automatic model partitioning, and dynamic execution strategies.
