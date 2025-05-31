@@ -826,7 +826,7 @@ class DynamicMemoryModule(nn.Module):
                 
                 return output
         
-        self.wrapped_module.forward = offload_forward
+        return offload_forward
     
     def _register_memory_hooks(self):
         """Register hooks for memory profiling."""
@@ -1054,7 +1054,7 @@ class DynamicMemoryModule(nn.Module):
             ]
         }
         
-        # Include chunk calculation info if available
+        # Include chunk calculation info if available  
         if hasattr(self, '_last_chunk_calculation') and self._last_chunk_calculation is not None:
             stats['chunk_info'] = {
                 'chunk_size': self._last_chunk_calculation['chunk_size'],
@@ -1083,8 +1083,8 @@ class DynamicMemoryModule(nn.Module):
             ]
         }
         
-        # Include chunk calculation info if available
-        if hasattr(self, '_last_chunk_calculation'):
+        # Include chunk calculation info if available  
+        if hasattr(self, '_last_chunk_calculation') and self._last_chunk_calculation is not None:
             stats['chunk_info'] = {
                 'chunk_size': self._last_chunk_calculation['chunk_size'],
                 'num_chunks': self._last_chunk_calculation['num_chunks'],
