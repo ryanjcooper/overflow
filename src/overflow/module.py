@@ -304,6 +304,24 @@ class DynamicMemoryModule(nn.Module):
                 # For other model types, use the partitioner
                 self.partitioner = ModelPartitioner(self.wrapped_module, device_list)
     
+    def _get_available_gpu_memory(self, device_id: int = 0) -> int:
+        """Get available GPU memory in bytes."""
+        try:
+            free_memory, _ = torch.cuda.mem_get_info(device_id)
+            return free_memory
+        except:
+            return 0
+    
+    def _estimate_layer_memory(self, layer: nn.Module) -> int:
+        """Estimate memory required for a layer in bytes."""
+        total_size = 0
+        for param in layer.parameters():
+            total_size += param.numel() * param.element_size()
+        for buffer in layer.buffers():
+            total_size += buffer.numel() * buffer.element_size()
+        # Add some overhead for activations (conservative estimate)
+        return int(total_size * 2)
+    
     def _setup_cpu_offload(self):
         """Setup CPU offloading for large models."""
         # Store original forward method
@@ -358,6 +376,22 @@ class DynamicMemoryModule(nn.Module):
                         
                         # Process each layer
                         for i, mod in enumerate(self.wrapped_module.layers):
+                            # Check if we have enough memory to move this layer
+                            required_memory = self._estimate_layer_memory(mod)
+                            available_memory = self._get_available_gpu_memory(device.index)
+                            
+                            if available_memory < required_memory * 1.5:  # Safety margin
+                                # Clear cache and try again
+                                torch.cuda.empty_cache()
+                                available_memory = self._get_available_gpu_memory(device.index)
+                                
+                                if available_memory < required_memory:
+                                    # Skip to next GPU if available
+                                    if num_gpus > 1:
+                                        device = cuda_devices[(gpu_idx + 1) % num_gpus]
+                                        output = output.to(device)
+                                        torch.cuda.empty_cache()
+                            
                             # Move layer to this GPU
                             mod = mod.to(device)
                             self.swap_manager.swap_stats['swaps_in'] += 1
@@ -403,6 +437,34 @@ class DynamicMemoryModule(nn.Module):
                     
                     # Process each transformer layer
                     for i, mod in enumerate(self.wrapped_module.layers):
+                        # Check available memory before moving layer
+                        required_memory = self._estimate_layer_memory(mod)
+                        available_memory = self._get_available_gpu_memory(device.index if device.type == 'cuda' else 0)
+                        
+                        if device.type == 'cuda' and available_memory < required_memory * 1.5:
+                            torch.cuda.empty_cache()
+                            available_memory = self._get_available_gpu_memory(device.index)
+                            
+                            if available_memory < required_memory:
+                                # If we can't fit even a single layer, try aggressive cleanup
+                                import gc
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                                
+                                available_memory = self._get_available_gpu_memory(device.index)
+                                if available_memory < required_memory:
+                                    # Last resort: process on CPU if GPU is too fragmented
+                                    print(f"Warning: Layer {i} too large for GPU ({required_memory/1024**2:.1f}MB > {available_memory/1024**2:.1f}MB available), processing on CPU")
+                                    # Process this layer on CPU
+                                    output = mod(output.cpu(), src_mask=mask.cpu() if mask is not None else None, 
+                                               src_key_padding_mask=src_key_padding_mask.cpu() if src_key_padding_mask is not None else None)
+                                    # Move output back to GPU for next layer
+                                    if device.type == 'cuda' and i < len(self.wrapped_module.layers) - 1:
+                                        output = output.to(device)
+                                    # Skip the GPU swap for this layer
+                                    continue
+                        
                         # Move layer to GPU
                         mod = mod.to(device)
                         self.swap_manager.swap_stats['swaps_in'] += 1

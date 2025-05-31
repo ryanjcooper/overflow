@@ -191,7 +191,8 @@ class TestIntegration:
         
         # Verify parameters match
         for p1, p2 in zip(wrapped.parameters(), new_wrapped.parameters()):
-            assert torch.allclose(p1, p2)
+            # Move to same device (CPU) for comparison
+            assert torch.allclose(p1.cpu(), p2.cpu())
     
     def test_data_loader_integration(self):
         """Test integration with PyTorch DataLoader."""
