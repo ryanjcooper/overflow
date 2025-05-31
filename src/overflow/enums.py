@@ -10,6 +10,7 @@ class ExecutionStrategy(Enum):
     """Execution strategies based on hardware capabilities."""
     STANDARD = "standard"
     GRADIENT_CHECKPOINT = "gradient_checkpoint"
+    DATA_PARALLEL = "data_parallel"
     MODEL_PARALLEL = "model_parallel"
     CPU_OFFLOAD = "cpu_offload"
     HYBRID = "hybrid"

@@ -72,17 +72,50 @@ input_tensor = torch.randn(16, 512, 2048)
 output = model(input_tensor)
 ```
 
+
 ## Execution Strategies
 
 Overflow automatically selects the best strategy based on your hardware:
 
 | Strategy | When Used | Description |
 |----------|-----------|-------------|
-| **Standard** | Model fits in GPU memory | Normal PyTorch execution |
-| **Gradient Checkpoint** | Model barely fits | Trades compute for memory by recomputing activations |
-| **Model Parallel** | Multiple GPUs available | Distributes model across GPUs |
-| **CPU Offload** | Model exceeds total GPU memory | Swaps tensors between GPU and CPU |
+| **Standard** | Model fits comfortably in GPU memory | Normal PyTorch execution |
+| **Gradient Checkpoint** | Model fits but activations don't | Trades compute for memory by recomputing activations |
+| **Data Parallel** | Model fits on one GPU + multiple GPUs available | Splits batch across GPUs for faster inference |
+| **Model Parallel** | Model too large for one GPU but fits across all | Distributes model layers across GPUs |
+| **CPU Offload** | Model exceeds total GPU memory | Dynamically swaps layers between CPU and GPU(s) |
 | **Hybrid** | Complex scenarios | Combines multiple strategies |
+
+### Strategy Selection Logic
+
+**Single GPU Systems:**
+- Model < 80% GPU memory → **Standard**
+- Model fits but activations don't → **Gradient Checkpoint**
+- Model > GPU memory → **CPU Offload**
+
+**Multi-GPU Systems:**
+- Model < 50% single GPU (inference only) → **Data Parallel** 
+- Model < 80% single GPU → **Standard** or **Gradient Checkpoint**
+- Model > single GPU but < total → **Model Parallel**
+- Model > total GPU memory → **CPU Offload** (uses all GPUs)
+
+### When is Data Parallel Beneficial?
+
+Data parallelism isn't always faster! It works best with:
+- **Large batch sizes** (32+ samples)
+- **Small models** (< 50% of GPU memory)
+- **Inference workloads** (not training)
+
+For small batches or training, the overhead of splitting data and synchronizing across GPUs often outweighs the benefits.
+
+```python
+# Force data parallel for specific use cases
+config = MemoryConfig(
+    prefer_data_parallel=True,  # Force data parallel for small models
+    data_parallel_threshold=0.5  # Model must be < 50% of GPU memory
+)
+model = DynamicMemoryModule(your_model, config=config)
+```
 
 ## Custom Configuration
 

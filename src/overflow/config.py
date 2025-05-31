@@ -25,3 +25,5 @@ class MemoryConfig:
     prefetch_size: int = 2  # Number of blocks to prefetch
     min_gpu_memory_mb: int = 1024  # Minimum GPU memory to keep free
     profile_interval: int = 10  # Profile every N forward passes
+    prefer_data_parallel: bool = False  # Force data parallel for small models on multi-GPU
+    data_parallel_threshold: float = 0.5  # Model must be < this fraction of GPU memory for data parallel

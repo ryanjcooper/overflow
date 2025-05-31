@@ -9,6 +9,7 @@ import warnings
 from typing import Dict, Optional, Any, Tuple
 
 from .enums import ExecutionStrategy
+import math
 from .config import MemoryConfig
 from .profiler import MemoryProfiler
 from .device_manager import DeviceManager
@@ -29,6 +30,9 @@ class DynamicMemoryModule(nn.Module):
         self.device_manager = DeviceManager()
         self.swap_manager = BlockSwapManager(self.config)
         
+        # Store training mode
+        self.training = module.training
+        
         # Determine execution strategy
         self.strategy = self._determine_strategy()
         
@@ -44,15 +48,26 @@ class DynamicMemoryModule(nn.Module):
         # Register hooks if profiling enabled
         if self.config.enable_profiling:
             self._register_memory_hooks()
+        
+        # Clear GPU cache after setup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def _move_to_device(self):
         """Move model to appropriate device based on strategy."""
         if self.strategy in [ExecutionStrategy.STANDARD, ExecutionStrategy.GRADIENT_CHECKPOINT]:
             if self.device_manager.primary_device.type == 'cuda':
                 self.wrapped_module = self.wrapped_module.to(self.device_manager.primary_device)
+        elif self.strategy == ExecutionStrategy.DATA_PARALLEL:
+            # For data parallel, move to primary GPU (DataParallel will handle the rest)
+            if self.device_manager.primary_device.type == 'cuda':
+                self.wrapped_module = self.wrapped_module.to(self.device_manager.primary_device)
         elif self.strategy == ExecutionStrategy.CPU_OFFLOAD:
             # Keep model on CPU for offloading strategy
             self.wrapped_module = self.wrapped_module.to('cpu')
+        elif self.strategy == ExecutionStrategy.MODEL_PARALLEL:
+            # For model parallel, we'll handle device placement in setup
+            pass
     
     def _determine_strategy(self) -> ExecutionStrategy:
         """Automatically determine the best execution strategy."""
@@ -60,27 +75,80 @@ class DynamicMemoryModule(nn.Module):
         total_gpu_memory = self.device_manager.get_total_gpu_memory()
         gpu_count = len([d for d in self.device_manager.devices if d.device_type == 'cuda'])
         
+        # Get single GPU memory (memory of the primary device)
+        single_gpu_memory = 0
+        if gpu_count > 0:
+            primary_device_id = int(self.device_manager.primary_device.index) if self.device_manager.primary_device.type == 'cuda' else 0
+            for d in self.device_manager.devices:
+                if d.device_type == 'cuda' and d.device_id == primary_device_id:
+                    single_gpu_memory = d.total_memory
+                    break
+        
         # Print diagnostic info
         print(f"Model size estimate: {model_size / 1024**3:.2f} GB")
         print(f"Total GPU memory: {total_gpu_memory / 1024**3:.2f} GB")
+        if gpu_count > 1:
+            print(f"Single GPU memory: {single_gpu_memory / 1024**3:.2f} GB")
+            print(f"Number of GPUs: {gpu_count}")
         
-        # Decision logic - adjusted for better thresholds
+        # Decision logic
         if total_gpu_memory == 0:
             # No GPU available
+            print("→ No GPU detected, using CPU execution")
             return ExecutionStrategy.CPU_OFFLOAD
         
         # Account for activation memory (roughly 2-3x model size during training)
-        activation_multiplier = 3.0
+        # For inference, we need less memory
+        activation_multiplier = 1.5 if not self.training else 3.0
         total_memory_needed = model_size * activation_multiplier
         
-        if total_memory_needed < total_gpu_memory * 0.8:  # 80% to leave room
-            return ExecutionStrategy.STANDARD
-        elif model_size < total_gpu_memory * 0.8:  # Model fits but activations might not
-            return ExecutionStrategy.GRADIENT_CHECKPOINT
-        elif gpu_count > 1 and model_size < total_gpu_memory * gpu_count * 0.8:
-            return ExecutionStrategy.MODEL_PARALLEL
+        # Single-GPU scenarios
+        if gpu_count == 1:
+            if total_memory_needed < single_gpu_memory * 0.8:
+                print("→ Model fits comfortably on single GPU")
+                return ExecutionStrategy.STANDARD
+            elif model_size < single_gpu_memory * 0.8:
+                print("→ Model fits but activations might not, using gradient checkpointing")
+                return ExecutionStrategy.GRADIENT_CHECKPOINT
+            else:
+                print("→ Model too large for GPU, using CPU offloading")
+                return ExecutionStrategy.CPU_OFFLOAD
+        
+        # Multi-GPU scenarios
         else:
-            return ExecutionStrategy.CPU_OFFLOAD
+            # For data parallel to be beneficial, we need:
+            # 1. Model to fit very comfortably on single GPU (< 50% for room)
+            # 2. Reasonable batch size (will be split across GPUs)
+            # 3. Not training (training typically benefits more from larger batch on single GPU)
+            
+            # Case 1: Very small model - consider data parallel only if not training
+            data_parallel_threshold = self.config.data_parallel_threshold if hasattr(self.config, 'data_parallel_threshold') else 0.5
+            prefer_data_parallel = self.config.prefer_data_parallel if hasattr(self.config, 'prefer_data_parallel') else False
+            
+            if model_size < single_gpu_memory * data_parallel_threshold and (not self.training or prefer_data_parallel):
+                print("→ Small model on multi-GPU, using data parallelism for potential speedup")
+                print("  Note: Speedup depends on batch size (larger batches benefit more)")
+                return ExecutionStrategy.DATA_PARALLEL
+            
+            # Case 2: Model fits comfortably on single GPU
+            elif total_memory_needed < single_gpu_memory * 0.8:
+                print("→ Model fits comfortably on single GPU with standard execution")
+                return ExecutionStrategy.STANDARD
+            
+            # Case 3: Model fits on single GPU with checkpointing
+            elif model_size < single_gpu_memory * 0.8:
+                print("→ Model fits on single GPU with gradient checkpointing")
+                return ExecutionStrategy.GRADIENT_CHECKPOINT
+            
+            # Case 4: Model doesn't fit on single GPU but fits across all GPUs
+            elif model_size < total_gpu_memory * 0.8:
+                print("→ Model too large for single GPU, using model parallelism")
+                return ExecutionStrategy.MODEL_PARALLEL
+            
+            # Case 5: Model too large even for all GPUs - CPU offload with multi-GPU support
+            else:
+                print("→ Model too large for all GPUs, using CPU offloading with multi-GPU acceleration")
+                return ExecutionStrategy.CPU_OFFLOAD
     
     def _estimate_model_size(self) -> int:
         """Estimate total model size in bytes."""
@@ -96,8 +164,12 @@ class DynamicMemoryModule(nn.Module):
         if self.strategy == ExecutionStrategy.GRADIENT_CHECKPOINT:
             print(f"Using gradient checkpointing strategy")
             self._setup_gradient_checkpointing()
+        elif self.strategy == ExecutionStrategy.DATA_PARALLEL:
+            print(f"Using data parallel strategy across {torch.cuda.device_count()} GPUs")
+            self._setup_data_parallel()
         elif self.strategy == ExecutionStrategy.MODEL_PARALLEL:
-            print(f"Using model parallel strategy across {len(self.device_manager.devices)} devices")
+            gpu_count = len([d for d in self.device_manager.devices if d.device_type == 'cuda'])
+            print(f"Using model parallel strategy across {gpu_count} GPUs")
             self._setup_model_parallel()
         elif self.strategy == ExecutionStrategy.CPU_OFFLOAD:
             print(f"Using CPU offload strategy")
@@ -141,20 +213,92 @@ class DynamicMemoryModule(nn.Module):
                 # Replace the forward method
                 module.forward = make_checkpoint_forward(module)
     
+    def _setup_data_parallel(self):
+        """Setup data parallelism across multiple GPUs."""
+        if torch.cuda.device_count() > 1:
+            # Get list of GPU IDs
+            device_ids = list(range(torch.cuda.device_count()))
+            
+            # Wrap model with DataParallel
+            self.wrapped_module = nn.DataParallel(
+                self.wrapped_module,
+                device_ids=device_ids,
+                output_device=device_ids[0]
+            )
+            
+            print(f"  Using GPUs: {device_ids}")
+            print(f"  Batch will be split across {len(device_ids)} GPUs")
+        else:
+            print("  Warning: Data parallel requested but only 1 GPU available")
+    
     def _setup_model_parallel(self):
         """Setup model parallelism across available GPUs."""
         devices = [d for d in self.device_manager.devices if d.device_type == 'cuda']
         if len(devices) > 1:
             device_list = [torch.device(f'cuda:{d.device_id}') for d in devices]
-            self.partitioner = ModelPartitioner(self.wrapped_module, device_list)
+            
+            # For TransformerEncoder, distribute layers across GPUs
+            if isinstance(self.wrapped_module, nn.TransformerEncoder):
+                num_layers = len(self.wrapped_module.layers)
+                layers_per_device = num_layers // len(device_list)
+                extra_layers = num_layers % len(device_list)
+                
+                # Store device assignments
+                self.layer_devices = []
+                layer_idx = 0
+                
+                for i, device in enumerate(device_list):
+                    # Distribute layers evenly, with extra layers going to first devices
+                    layers_on_this_device = layers_per_device + (1 if i < extra_layers else 0)
+                    
+                    for j in range(layers_on_this_device):
+                        if layer_idx < num_layers:
+                            self.wrapped_module.layers[layer_idx] = self.wrapped_module.layers[layer_idx].to(device)
+                            self.layer_devices.append(device)
+                            layer_idx += 1
+                
+                # Move norm layer to last device if it exists
+                if hasattr(self.wrapped_module, 'norm') and self.wrapped_module.norm is not None:
+                    self.wrapped_module.norm = self.wrapped_module.norm.to(device_list[-1])
+                
+                # Store original forward for model parallel execution
+                self._original_forward = self.wrapped_module.forward
+                
+                # Replace forward with model parallel version
+                def model_parallel_forward(src, mask=None, src_key_padding_mask=None):
+                    output = src
+                    
+                    # Process each layer on its assigned device
+                    for i, (layer, device) in enumerate(zip(self.wrapped_module.layers, self.layer_devices)):
+                        # Move data to the layer's device
+                        output = output.to(device)
+                        if mask is not None and mask.device != device:
+                            mask = mask.to(device)
+                        if src_key_padding_mask is not None and src_key_padding_mask.device != device:
+                            src_key_padding_mask = src_key_padding_mask.to(device)
+                        
+                        # Forward through layer
+                        output = layer(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+                    
+                    # Apply final norm if exists
+                    if hasattr(self.wrapped_module, 'norm') and self.wrapped_module.norm is not None:
+                        output = self.wrapped_module.norm(output)
+                    
+                    return output
+                
+                self.wrapped_module.forward = model_parallel_forward
+            else:
+                # For other model types, use the partitioner
+                self.partitioner = ModelPartitioner(self.wrapped_module, device_list)
     
     def _setup_cpu_offload(self):
         """Setup CPU offloading for large models."""
-        # For CPU offloading, we'll implement a simple layer-by-layer execution
-        # This is a basic implementation - a production version would be more sophisticated
-        
         # Store original forward method
         self._original_forward = self.wrapped_module.forward
+        
+        # Get available GPUs for round-robin offloading
+        cuda_devices = [torch.device(f'cuda:{d.device_id}') for d in self.device_manager.devices if d.device_type == 'cuda']
+        num_gpus = len(cuda_devices)
         
         # Replace with offloading forward
         def offload_forward(*args, **kwargs):
@@ -164,42 +308,113 @@ class DynamicMemoryModule(nn.Module):
                 mask = kwargs.get('mask', None)
                 src_key_padding_mask = kwargs.get('src_key_padding_mask', None)
                 
-                # Move input to GPU
-                device = self.device_manager.primary_device
-                src = src.to(device)
-                if mask is not None:
-                    mask = mask.to(device)
-                if src_key_padding_mask is not None:
-                    src_key_padding_mask = src_key_padding_mask.to(device)
+                # Initialize outputs list for accumulating results from different GPUs
+                outputs = []
                 
-                output = src
-                
-                # Process each transformer layer
-                for i, mod in enumerate(self.wrapped_module.layers):
-                    # Move layer to GPU
-                    mod = mod.to(device)
-                    self.swap_manager.swap_stats['swaps_in'] += 1
+                # For multi-GPU: Split batch across GPUs for parallel processing
+                if num_gpus > 1:
+                    batch_size = src.size(0) if src.dim() > 1 else 1
                     
-                    # Forward pass through this layer
-                    output = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+                    # Calculate splits
+                    splits = []
+                    base_size = batch_size // num_gpus
+                    remainder = batch_size % num_gpus
                     
-                    # Move layer back to CPU
-                    mod = mod.to('cpu')
-                    self.swap_manager.swap_stats['swaps_out'] += 1
+                    start = 0
+                    for i in range(num_gpus):
+                        size = base_size + (1 if i < remainder else 0)
+                        if size > 0:
+                            splits.append((start, start + size))
+                            start += size
                     
-                    # Clear cache periodically
-                    if i % 4 == 0:
-                        torch.cuda.empty_cache()
+                    # Process each split on a different GPU
+                    for gpu_idx, (start_idx, end_idx) in enumerate(splits):
+                        device = cuda_devices[gpu_idx % num_gpus]
+                        
+                        # Get batch slice
+                        src_slice = src[start_idx:end_idx].to(device)
+                        mask_slice = mask[start_idx:end_idx] if mask is not None else None
+                        padding_mask_slice = src_key_padding_mask[start_idx:end_idx] if src_key_padding_mask is not None else None
+                        
+                        if mask_slice is not None:
+                            mask_slice = mask_slice.to(device)
+                        if padding_mask_slice is not None:
+                            padding_mask_slice = padding_mask_slice.to(device)
+                        
+                        output = src_slice
+                        
+                        # Process each layer
+                        for i, mod in enumerate(self.wrapped_module.layers):
+                            # Move layer to this GPU
+                            mod = mod.to(device)
+                            self.swap_manager.swap_stats['swaps_in'] += 1
+                            
+                            # Forward pass
+                            output = mod(output, src_mask=mask_slice, src_key_padding_mask=padding_mask_slice)
+                            
+                            # Move layer back to CPU
+                            mod = mod.to('cpu')
+                            self.swap_manager.swap_stats['swaps_out'] += 1
+                            
+                            # Clear cache periodically
+                            if i % 2 == 0:
+                                torch.cuda.empty_cache()
+                        
+                        # Apply final layer norm if exists
+                        if self.wrapped_module.norm is not None:
+                            self.wrapped_module.norm = self.wrapped_module.norm.to(device)
+                            output = self.wrapped_module.norm(output)
+                            self.wrapped_module.norm = self.wrapped_module.norm.to('cpu')
+                        
+                        outputs.append(output.cpu())
+                    
+                    # Concatenate results
+                    final_output = torch.cat(outputs, dim=0)
+                    
+                    # Move to first GPU if needed
+                    if len(args) > 0 and isinstance(args[0], torch.Tensor) and args[0].is_cuda:
+                        final_output = final_output.to(args[0].device)
+                    
+                    return final_output
                 
-                # Apply final layer norm if it exists
-                if self.wrapped_module.norm is not None:
-                    self.wrapped_module.norm = self.wrapped_module.norm.to(device)
-                    self.swap_manager.swap_stats['swaps_in'] += 1
-                    output = self.wrapped_module.norm(output)
-                    self.wrapped_module.norm = self.wrapped_module.norm.to('cpu')
-                    self.swap_manager.swap_stats['swaps_out'] += 1
-                
-                return output
+                else:
+                    # Single GPU path
+                    device = cuda_devices[0] if cuda_devices else torch.device('cpu')
+                    src = src.to(device)
+                    if mask is not None:
+                        mask = mask.to(device)
+                    if src_key_padding_mask is not None:
+                        src_key_padding_mask = src_key_padding_mask.to(device)
+                    
+                    output = src
+                    
+                    # Process each transformer layer
+                    for i, mod in enumerate(self.wrapped_module.layers):
+                        # Move layer to GPU
+                        mod = mod.to(device)
+                        self.swap_manager.swap_stats['swaps_in'] += 1
+                        
+                        # Forward pass through this layer
+                        output = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+                        
+                        # Move layer back to CPU
+                        mod = mod.to('cpu')
+                        self.swap_manager.swap_stats['swaps_out'] += 1
+                        
+                        # Clear cache periodically
+                        if i % 4 == 0:
+                            torch.cuda.empty_cache()
+                    
+                    # Apply final layer norm if it exists
+                    if self.wrapped_module.norm is not None:
+                        self.wrapped_module.norm = self.wrapped_module.norm.to(device)
+                        self.swap_manager.swap_stats['swaps_in'] += 1
+                        output = self.wrapped_module.norm(output)
+                        self.wrapped_module.norm = self.wrapped_module.norm.to('cpu')
+                        self.swap_manager.swap_stats['swaps_out'] += 1
+                    
+                    return output
+            
             else:
                 # General fallback for other model types
                 device = self.device_manager.primary_device
@@ -278,6 +493,10 @@ class DynamicMemoryModule(nn.Module):
     
     def _get_module_device(self, module: nn.Module) -> torch.device:
         """Get the device of a module."""
+        # Handle DataParallel wrapped modules
+        if isinstance(module, nn.DataParallel):
+            return torch.device(f'cuda:{module.device_ids[0]}')
+        
         try:
             # Try to get device from parameters
             return next(module.parameters()).device
@@ -286,20 +505,36 @@ class DynamicMemoryModule(nn.Module):
             try:
                 return next(module.buffers()).device
             except StopIteration:
-                # No parameters or buffers, use primary device
+                # No parameters or buffers
+                # For model parallel, return the first GPU device
+                if self.strategy == ExecutionStrategy.MODEL_PARALLEL:
+                    cuda_devices = [d for d in self.device_manager.devices if d.device_type == 'cuda']
+                    if cuda_devices:
+                        return torch.device(f'cuda:{cuda_devices[0].device_id}')
+                # Otherwise use primary device
                 return self.device_manager.primary_device
     
     def forward(self, *args, **kwargs):
         """Forward pass with memory management."""
-        # For CPU offloading, don't move inputs here - let the offload forward handle it
-        if self.strategy != ExecutionStrategy.CPU_OFFLOAD:
+        # For CPU offloading and model parallel, don't move inputs here - let the strategy handle it
+        if self.strategy not in [ExecutionStrategy.CPU_OFFLOAD, ExecutionStrategy.MODEL_PARALLEL]:
             # Move inputs to appropriate device if needed
             device = self._get_module_device(self.wrapped_module)
             args = self._move_tensors_to_device(args, device)
             kwargs = self._move_tensors_to_device(kwargs, device)
         
         # Get device for profiling
-        device = self.device_manager.primary_device if self.strategy == ExecutionStrategy.CPU_OFFLOAD else self._get_module_device(self.wrapped_module)
+        if self.strategy == ExecutionStrategy.CPU_OFFLOAD:
+            device = self.device_manager.primary_device
+        elif self.strategy == ExecutionStrategy.MODEL_PARALLEL:
+            # For model parallel, use the first GPU for profiling
+            cuda_devices = [d for d in self.device_manager.devices if d.device_type == 'cuda']
+            device = torch.device(f'cuda:{cuda_devices[0].device_id}') if cuda_devices else self.device_manager.primary_device
+        elif self.strategy == ExecutionStrategy.DATA_PARALLEL:
+            # For data parallel, use the primary device
+            device = self.device_manager.primary_device
+        else:
+            device = self._get_module_device(self.wrapped_module)
         
         # Profile memory before forward pass
         if self.config.enable_profiling:
@@ -310,11 +545,11 @@ class DynamicMemoryModule(nn.Module):
         if self.config.enable_profiling and device.type == 'cuda':
             pressure = self.memory_profiler.get_memory_pressure(device)
             
-            if pressure > self.config.offload_threshold and self.strategy != ExecutionStrategy.CPU_OFFLOAD:
-                warnings.warn(f"High memory pressure detected ({pressure:.1%}). Consider enabling CPU offload.")
+            if pressure > self.config.offload_threshold and self.strategy not in [ExecutionStrategy.CPU_OFFLOAD, ExecutionStrategy.MODEL_PARALLEL]:
+                warnings.warn(f"High memory pressure detected ({pressure:.1%}). Consider enabling CPU offload or model parallelism.")
         
         # Execute forward pass based on strategy
-        if self.strategy == ExecutionStrategy.MODEL_PARALLEL and hasattr(self, 'partitioner'):
+        if self.strategy == ExecutionStrategy.MODEL_PARALLEL and hasattr(self, 'layer_devices'):
             output = self._forward_model_parallel(*args, **kwargs)
         else:
             output = self.wrapped_module(*args, **kwargs)
@@ -352,8 +587,16 @@ class DynamicMemoryModule(nn.Module):
     
     def _forward_model_parallel(self, *args, **kwargs):
         """Forward pass with model parallelism."""
-        # Simplified model parallel forward - real implementation would be more sophisticated
-        # This is a placeholder showing the concept
+        # For TransformerEncoder with custom forward, it's already handled
+        if isinstance(self.wrapped_module, nn.TransformerEncoder) and hasattr(self, 'layer_devices'):
+            return self.wrapped_module(*args, **kwargs)
+        
+        # For other models using partitioner
+        if hasattr(self, 'partitioner'):
+            # Basic implementation - would need more sophisticated handling for complex models
+            return self.wrapped_module(*args, **kwargs)
+        
+        # Fallback
         return self.wrapped_module(*args, **kwargs)
     
     def __getattr__(self, name):
