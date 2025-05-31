@@ -131,6 +131,11 @@ class TestHardwareScenarios:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         
+        # Check available GPU memory before test
+        free_memory = torch.cuda.mem_get_info(0)[0] / 1024**3
+        if free_memory < 5:  # Less than 5GB free
+            pytest.skip(f"Insufficient GPU memory for test (only {free_memory:.1f}GB free)")
+        
         # Mock single GPU scenario
         with patch('torch.cuda.device_count', return_value=1):
             gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -169,6 +174,11 @@ class TestHardwareScenarios:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         
+        # Check available GPU memory
+        free_memory = torch.cuda.mem_get_info(0)[0] / 1024**3
+        if free_memory < 5:  # Less than 5GB free
+            pytest.skip(f"Insufficient GPU memory for test (only {free_memory:.1f}GB free)")
+        
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         
         # Very small model that fits easily on one GPU
@@ -193,6 +203,15 @@ class TestHardwareScenarios:
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires multiple GPUs")
     def test_multi_gpu_model_parallel(self):
         """Test model parallel strategy on multiple GPUs."""
+        # First cleanup
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # Check available GPU memory
+        free_memory = torch.cuda.mem_get_info(0)[0] / 1024**3
+        if free_memory < 5:  # Less than 5GB free
+            pytest.skip(f"Insufficient GPU memory for test (only {free_memory:.1f}GB free)")
+        
         single_gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         total_gpu_memory_gb = single_gpu_memory_gb * torch.cuda.device_count()
         
@@ -263,28 +282,46 @@ class TestHardwareScenarios:
         """Test behavior on system with very limited memory."""
         model = nn.Sequential(*[nn.Linear(100, 100) for _ in range(5)])
         
-        # Mock very limited memory
-        with patch('overflow.device_manager.DeviceManager') as MockDeviceManager:
-            mock_manager = MagicMock()
-            mock_manager.get_total_gpu_memory.return_value = 10 * 1024**2  # 10MB
-            mock_manager.get_available_gpu_memory.return_value = 8 * 1024**2
-            mock_manager.primary_device = torch.device('cpu')  # Force CPU
-            mock_manager.devices = [
-                MagicMock(device_type='cpu', device_id=0, total_memory=1*1024**3, available_memory=500*1024**2, device_name='CPU')
-            ]
-            MockDeviceManager.return_value = mock_manager
-            
-            # Also mock the module's device manager after creation
-            with patch('overflow.module.DeviceManager', MockDeviceManager):
-                wrapped = DynamicMemoryModule(model)
-                
-                # Should use CPU offload
-                assert wrapped.strategy == ExecutionStrategy.CPU_OFFLOAD
-                
-                # Test with small batch
-                x = torch.randn(2, 100)
-                output = wrapped(x)
-                assert output.shape == (2, 100)
+        # Mock very limited memory - properly mock a CPU-only system
+        with patch('overflow.device_manager.torch.cuda.is_available', return_value=False):
+            with patch('overflow.device_manager.torch.cuda.device_count', return_value=0):
+                with patch('overflow.module.torch.cuda.is_available', return_value=False):
+                    # Create a fresh DeviceManager instance for this test
+                    from overflow.device_manager import DeviceManager
+                    
+                    # Mock the DeviceManager to return CPU-only configuration
+                    original_detect = DeviceManager._detect_devices
+                    
+                    def mock_detect_devices(self):
+                        """Mock device detection to return only CPU."""
+                        import psutil
+                        from overflow.config import DeviceInfo
+                        
+                        vm = psutil.virtual_memory()
+                        return [DeviceInfo(
+                            device_id=0,
+                            device_type='cpu',
+                            total_memory=vm.total,
+                            available_memory=vm.available,
+                            device_name='CPU'
+                        )]
+                    
+                    # Patch the method
+                    DeviceManager._detect_devices = mock_detect_devices
+                    
+                    try:
+                        wrapped = DynamicMemoryModule(model)
+                        
+                        # Should use CPU offload
+                        assert wrapped.strategy == ExecutionStrategy.CPU_OFFLOAD
+                        
+                        # Test with small batch
+                        x = torch.randn(2, 100)
+                        output = wrapped(x)
+                        assert output.shape == (2, 100)
+                    finally:
+                        # Restore original method
+                        DeviceManager._detect_devices = original_detect
     
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
     def test_memory_pressure_adaptation(self):

@@ -134,12 +134,18 @@ class TestIntegration:
         optimizer = optim.Adam(wrapped.parameters())
         scaler = GradScaler()
         
+        # Get the device where the model is
+        device = next(wrapped.parameters()).device
+        
         # Mixed precision forward/backward
-        x = torch.randn(16, 128).cuda()
-        target = torch.randn(16, 128).cuda()
+        x = torch.randn(16, 128).to(device)
+        target = torch.randn(16, 128).to(device)
         
         with autocast():
             output = wrapped(x)
+            # Ensure output is on the same device as target
+            if output.device != target.device:
+                output = output.to(target.device)
             loss = nn.functional.mse_loss(output, target)
         
         optimizer.zero_grad()

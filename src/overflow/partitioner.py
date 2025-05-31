@@ -22,7 +22,8 @@ class ModelPartitioner:
         # Calculate memory per module
         module_sizes = {}
         for name, module in self.model.named_modules():
-            if len(list(module.children())) == 0:  # Leaf module
+            # Skip the root module and only process leaf modules
+            if name and len(list(module.children())) == 0:  # Leaf module
                 param_size = sum(p.numel() * p.element_size() for p in module.parameters())
                 buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
                 module_sizes[name] = param_size + buffer_size
