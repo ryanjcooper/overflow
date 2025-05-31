@@ -260,9 +260,13 @@ class TestDynamicMemoryModule:
         assert wrapped_small.strategy == ExecutionStrategy.STANDARD
         
         # Large model - should use different strategy
+        # Mock the device manager to simulate limited GPU memory
         large_model = nn.Sequential(*[nn.Linear(5000, 5000) for _ in range(20)])
-        wrapped_large = DynamicMemoryModule(large_model)
-        assert wrapped_large.strategy != ExecutionStrategy.STANDARD
+        
+        with patch.object(DeviceManager, 'get_total_gpu_memory', return_value=2 * 1024**3):  # 2GB GPU
+            wrapped_large = DynamicMemoryModule(large_model)
+            # Model is ~2GB, GPU is 2GB, so it should trigger a different strategy
+            assert wrapped_large.strategy != ExecutionStrategy.STANDARD
     
     def test_forward_pass(self):
         """Test forward pass through wrapper."""
@@ -451,16 +455,19 @@ class TestIntegration:
             checkpoint_threshold=0.5,
             offload_threshold=0.7
         )
-        wrapped = DynamicMemoryModule(model, config)
         
-        # Should select appropriate strategy
-        assert wrapped.strategy != ExecutionStrategy.STANDARD
-        
-        # Run forward pass
-        x = torch.randn(32, 1000)
-        output = wrapped(x)
-        
-        assert output.shape == (32, 1000)
+        # Mock limited GPU memory to ensure non-STANDARD strategy
+        with patch.object(DeviceManager, 'get_total_gpu_memory', return_value=50 * 1024**2):  # 50MB GPU
+            wrapped = DynamicMemoryModule(model, config)
+            
+            # Should select appropriate strategy (model is ~40MB, GPU is 50MB)
+            assert wrapped.strategy != ExecutionStrategy.STANDARD
+            
+            # Run forward pass
+            x = torch.randn(32, 1000)
+            output = wrapped(x)
+            
+            assert output.shape == (32, 1000)
 
 
 @pytest.fixture(autouse=True)
