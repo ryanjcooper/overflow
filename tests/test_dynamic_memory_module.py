@@ -189,12 +189,23 @@ class TestDynamicMemoryModule:
         model_train.train()
         wrapped_train = DynamicMemoryModule(model_train)
         assert wrapped_train.training == True
+        assert wrapped_train.wrapped_module.training == True
         
         # Test with model in eval mode
         model_eval = nn.Linear(10, 10)
         model_eval.eval()
         wrapped_eval = DynamicMemoryModule(model_eval)
         assert wrapped_eval.training == False
+        assert wrapped_eval.wrapped_module.training == False
+        
+        # Test switching modes after wrapping
+        wrapped_eval.train()
+        assert wrapped_eval.training == True
+        assert wrapped_eval.wrapped_module.training == True
+        
+        wrapped_eval.eval()
+        assert wrapped_eval.training == False
+        assert wrapped_eval.wrapped_module.training == False
     
     def test_device_placement(self):
         """Test that model is placed on correct device based on strategy."""

@@ -92,6 +92,10 @@ class TestHardwareScenarios:
             
             output = wrapped(x)
             assert output.shape == (4, 128, 1024)
+            
+            # Cleanup
+            del model, wrapped, output, x
+            torch.cuda.empty_cache()
     
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
     def test_single_gpu_medium_model(self):
@@ -115,10 +119,18 @@ class TestHardwareScenarios:
             
             output = wrapped(x)
             assert output.shape == (2, 64, 1024)
+            
+            # Cleanup
+            del model, wrapped, output, x
+            torch.cuda.empty_cache()
     
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
     def test_single_gpu_large_model(self):
         """Test model that requires CPU offloading on single GPU."""
+        # First cleanup any existing GPU memory
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
         # Mock single GPU scenario
         with patch('torch.cuda.device_count', return_value=1):
             gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -145,10 +157,18 @@ class TestHardwareScenarios:
             # Verify CPU offloading happened
             stats = wrapped.get_memory_stats()
             assert stats['swap_stats']['swaps_out'] > 0
+            
+            # Cleanup
+            del model, wrapped, output, x
+            torch.cuda.empty_cache()
     
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires multiple GPUs")
     def test_multi_gpu_data_parallel(self):
         """Test data parallel strategy on multiple GPUs."""
+        # First cleanup
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         
         # Very small model that fits easily on one GPU
@@ -165,6 +185,10 @@ class TestHardwareScenarios:
         x = torch.randn(32, 128, 1024)
         output = wrapped(x)
         assert output.shape == (32, 128, 1024)
+        
+        # Cleanup
+        del model, wrapped, output, x
+        torch.cuda.empty_cache()
     
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires multiple GPUs")
     def test_multi_gpu_model_parallel(self):
@@ -186,6 +210,10 @@ class TestHardwareScenarios:
         x = torch.randn(2, 64, 1024)
         output = wrapped(x)
         assert output.shape == (2, 64, 1024)
+        
+        # Cleanup
+        del model, wrapped, output, x
+        torch.cuda.empty_cache()
     
     def test_cpu_only_execution(self):
         """Test execution on CPU-only systems."""
@@ -236,7 +264,7 @@ class TestHardwareScenarios:
         model = nn.Sequential(*[nn.Linear(100, 100) for _ in range(5)])
         
         # Mock very limited memory
-        with patch('overflow.module.DeviceManager') as MockDeviceManager:
+        with patch('overflow.device_manager.DeviceManager') as MockDeviceManager:
             mock_manager = MagicMock()
             mock_manager.get_total_gpu_memory.return_value = 10 * 1024**2  # 10MB
             mock_manager.get_available_gpu_memory.return_value = 8 * 1024**2
@@ -246,15 +274,17 @@ class TestHardwareScenarios:
             ]
             MockDeviceManager.return_value = mock_manager
             
-            wrapped = DynamicMemoryModule(model)
-            
-            # Should use CPU offload
-            assert wrapped.strategy == ExecutionStrategy.CPU_OFFLOAD
-            
-            # Test with small batch
-            x = torch.randn(2, 100)
-            output = wrapped(x)
-            assert output.shape == (2, 100)
+            # Also mock the module's device manager after creation
+            with patch('overflow.module.DeviceManager', MockDeviceManager):
+                wrapped = DynamicMemoryModule(model)
+                
+                # Should use CPU offload
+                assert wrapped.strategy == ExecutionStrategy.CPU_OFFLOAD
+                
+                # Test with small batch
+                x = torch.randn(2, 100)
+                output = wrapped(x)
+                assert output.shape == (2, 100)
     
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
     def test_memory_pressure_adaptation(self):
@@ -284,3 +314,7 @@ class TestHardwareScenarios:
         
         # Should complete without OOM
         assert output.shape == (16, 2000)
+        
+        # Cleanup
+        del model, wrapped, output, x
+        torch.cuda.empty_cache()

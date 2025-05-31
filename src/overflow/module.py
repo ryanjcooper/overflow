@@ -30,7 +30,7 @@ class DynamicMemoryModule(nn.Module):
         self.device_manager = DeviceManager()
         self.swap_manager = BlockSwapManager(self.config)
         
-        # Store training mode
+        # Preserve training mode from wrapped module
         self.training = module.training
         
         # Determine execution strategy
@@ -52,6 +52,12 @@ class DynamicMemoryModule(nn.Module):
         # Clear GPU cache after setup
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        
+        # Ensure we maintain the same training mode as the wrapped module
+        if module.training:
+            self.train()
+        else:
+            self.eval()
     
     def _move_to_device(self):
         """Move model to appropriate device based on strategy."""
@@ -181,6 +187,8 @@ class DynamicMemoryModule(nn.Module):
     def _setup_gradient_checkpointing(self):
         """Setup gradient checkpointing for memory-intensive layers."""
         import functools
+        # Fix: correct import for checkpoint
+        from torch.utils.checkpoint import checkpoint
         
         # Apply checkpointing to transformer layers
         for module in self.wrapped_module.modules():
@@ -199,7 +207,7 @@ class DynamicMemoryModule(nn.Module):
                         
                         # Use checkpoint only during training
                         if m.training:
-                            return torch.utils.checkpoint.checkpoint(
+                            return checkpoint(
                                 run_function,
                                 *args,
                                 use_reentrant=False,
@@ -604,6 +612,18 @@ class DynamicMemoryModule(nn.Module):
         # Fallback
         return self.wrapped_module(*args, **kwargs)
     
+    def train(self, mode: bool = True):
+        """Set the module in training mode."""
+        self.training = mode
+        self.wrapped_module.train(mode)
+        return self
+    
+    def eval(self):
+        """Set the module in evaluation mode."""
+        self.training = False
+        self.wrapped_module.eval()
+        return self
+    
     def __getattr__(self, name):
         """Delegate attribute access to wrapped module."""
         try:
@@ -614,7 +634,8 @@ class DynamicMemoryModule(nn.Module):
     def __setattr__(self, name, value):
         """Delegate attribute setting appropriately."""
         if name in ['wrapped_module', 'config', 'memory_profiler', 'device_manager', 
-                    'swap_manager', 'strategy', 'partitioner', '_pre_forward_memory', '_original_forward']:
+                    'swap_manager', 'strategy', 'partitioner', '_pre_forward_memory', '_original_forward',
+                    'training', 'layer_devices']:
             super().__setattr__(name, value)
         else:
             setattr(self.wrapped_module, name, value)

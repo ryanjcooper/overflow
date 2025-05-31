@@ -101,7 +101,8 @@ class TestDeviceManager:
             best_device = max(cuda_devices, key=lambda d: d.available_memory)
             
             # Primary device should be this GPU
-            assert manager.primary_device.index == str(best_device.device_id)
+            # Fix: device.index is an int, not a string
+            assert manager.primary_device.index == best_device.device_id
     
     def test_cpu_always_detected(self):
         """Test that CPU is always detected as a device."""
