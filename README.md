@@ -160,12 +160,12 @@ for epoch in range(num_epochs):
 ### Mixed Precision Training
 
 ```python
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 model = DynamicMemoryModule(your_model)
-scaler = GradScaler()
+scaler = GradScaler('cuda')
 
-with autocast():
+with autocast('cuda'):
     output = model(input)
     loss = loss_fn(output, target)
 

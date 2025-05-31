@@ -86,7 +86,7 @@ def mixed_precision_training_example():
         print("This example requires CUDA for mixed precision training.")
         return
     
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.amp import autocast, GradScaler
     
     # Create a model
     model = nn.TransformerEncoder(
@@ -100,7 +100,7 @@ def mixed_precision_training_example():
     
     # Setup for mixed precision training
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     
     # Create dummy data
     batch_size = 16
@@ -122,9 +122,12 @@ def mixed_precision_training_example():
             if batch_idx >= 5:  # Just a few steps for demo
                 break
             
+            # Move targets to same device as model outputs will be
+            # The model handles moving inputs automatically
             # Mixed precision forward pass
-            with autocast():
+            with autocast('cuda'):
                 outputs = model(inputs)
+                targets = targets.to(outputs.device)
                 loss = nn.functional.mse_loss(outputs, targets)
             
             # Mixed precision backward pass
@@ -165,6 +168,11 @@ def model_state_management_example():
     x = torch.randn(10, 256)
     y = torch.randn(10, 256)
     
+    # Get the device where the model is
+    device = next(wrapped_model.parameters()).device
+    x = x.to(device)
+    y = y.to(device)
+    
     print("Training model...")
     for i in range(3):
         output = wrapped_model(x)
@@ -198,9 +206,15 @@ def model_state_management_example():
     
     # Verify the models produce same output
     with torch.no_grad():
-        original_output = wrapped_model(x)
-        new_output = new_wrapped(x)
-        difference = torch.abs(original_output - new_output).max().item()
+        # Ensure x is on the correct device for both models
+        x_wrapped = x.to(next(wrapped_model.parameters()).device)
+        x_new = x.to(next(new_wrapped.parameters()).device)
+        
+        original_output = wrapped_model(x_wrapped)
+        new_output = new_wrapped(x_new)
+        
+        # Move outputs to same device for comparison
+        difference = torch.abs(original_output.cpu() - new_output.cpu()).max().item()
     
     print(f"✓ Model loaded successfully!")
     print(f"  Max difference in outputs: {difference:.8f}")

@@ -91,7 +91,14 @@ class DynamicMemoryModule(nn.Module):
                     break
         
         # Print diagnostic info
-        print(f"Model size estimate: {model_size / 1024**3:.2f} GB")
+        # Use appropriate units for model size
+        model_size_gb = model_size / 1024**3
+        if model_size_gb < 1.0:
+            model_size_mb = model_size / 1024**2
+            print(f"Model size estimate: {model_size_mb:.1f} MB")
+        else:
+            print(f"Model size estimate: {model_size_gb:.2f} GB")
+        
         print(f"Total GPU memory: {total_gpu_memory / 1024**3:.2f} GB")
         if gpu_count > 1:
             print(f"Single GPU memory: {single_gpu_memory / 1024**3:.2f} GB")
@@ -168,21 +175,14 @@ class DynamicMemoryModule(nn.Module):
     def _setup_execution(self):
         """Setup execution based on selected strategy."""
         if self.strategy == ExecutionStrategy.GRADIENT_CHECKPOINT:
-            print(f"Using gradient checkpointing strategy")
             self._setup_gradient_checkpointing()
         elif self.strategy == ExecutionStrategy.DATA_PARALLEL:
-            print(f"Using data parallel strategy across {torch.cuda.device_count()} GPUs")
             self._setup_data_parallel()
         elif self.strategy == ExecutionStrategy.MODEL_PARALLEL:
-            gpu_count = len([d for d in self.device_manager.devices if d.device_type == 'cuda'])
-            print(f"Using model parallel strategy across {gpu_count} GPUs")
             self._setup_model_parallel()
         elif self.strategy == ExecutionStrategy.CPU_OFFLOAD:
-            print(f"Using CPU offload strategy")
             self.swap_manager.start()
             self._setup_cpu_offload()
-        else:
-            print(f"Using standard execution strategy")
     
     def _setup_gradient_checkpointing(self):
         """Setup gradient checkpointing for memory-intensive layers."""

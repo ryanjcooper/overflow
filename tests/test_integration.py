@@ -123,7 +123,7 @@ class TestIntegration:
         if not torch.cuda.is_available():
             pytest.skip("Mixed precision requires CUDA")
         
-        from torch.cuda.amp import autocast, GradScaler
+        from torch.amp import autocast, GradScaler
         
         model = nn.Sequential(
             nn.Linear(128, 256),
@@ -132,7 +132,7 @@ class TestIntegration:
         )
         wrapped = DynamicMemoryModule(model)
         optimizer = optim.Adam(wrapped.parameters())
-        scaler = GradScaler()
+        scaler = GradScaler('cuda')
         
         # Get the device where the model is
         device = next(wrapped.parameters()).device
@@ -141,7 +141,7 @@ class TestIntegration:
         x = torch.randn(16, 128).to(device)
         target = torch.randn(16, 128).to(device)
         
-        with autocast():
+        with autocast('cuda'):
             output = wrapped(x)
             # Ensure output is on the same device as target
             if output.device != target.device:

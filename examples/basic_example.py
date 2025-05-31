@@ -179,9 +179,13 @@ def training_example():
         inputs = torch.randn(batch_size, 128)
         labels = torch.randint(0, 10, (batch_size,))
         
+        # Move labels to the same device as model outputs
+        # The model will handle moving inputs to the correct device
+        outputs = model(inputs)
+        labels = labels.to(outputs.device)
+        
         # Standard training loop
         optimizer.zero_grad()
-        outputs = model(inputs)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
