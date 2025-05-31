@@ -6,7 +6,8 @@ Command-line interface for Overflow package
 import argparse
 import torch
 import psutil
-from overflow import DeviceManager, __version__
+from .device_manager import DeviceManager
+from . import __version__
 
 
 def format_bytes(bytes_value):
