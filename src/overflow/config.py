@@ -27,3 +27,9 @@ class MemoryConfig:
     profile_interval: int = 10  # Profile every N forward passes
     prefer_data_parallel: bool = False  # Force data parallel for small models on multi-GPU
     data_parallel_threshold: float = 0.5  # Model must be < this fraction of GPU memory for data parallel
+    
+    # CPU Offload Optimization Settings
+    cpu_offload_strategy: str = "sequential"  # "sequential" or "chunked"
+    cpu_offload_chunk_size: int = 0  # 0 = auto-calculate, >0 = fixed chunk size
+    cpu_offload_gpu_percent: float = 0.8  # Use this % of GPU memory for chunks
+    cpu_offload_overlap: bool = True  # Overlap CPU-GPU transfers when possible

@@ -331,6 +331,137 @@ class DynamicMemoryModule(nn.Module):
         cuda_devices = [torch.device(f'cuda:{d.device_id}') for d in self.device_manager.devices if d.device_type == 'cuda']
         num_gpus = len(cuda_devices)
         
+        # Check if we should use chunked offloading
+        use_chunked = self._should_use_chunked_offloading()
+        
+        if use_chunked:
+            print("  → Using optimized chunked CPU offloading for better performance")
+            self._setup_chunked_cpu_offload()
+        else:
+            print("  → Using sequential CPU offloading")
+            self._setup_sequential_cpu_offload()
+    
+    def _should_use_chunked_offloading(self) -> bool:
+        """Determine if chunked offloading would be beneficial."""
+        # Check if model has layers (transformer-style)
+        if not hasattr(self.wrapped_module, 'layers'):
+            return False
+        
+        # Get available GPU memory
+        total_gpu_memory = self.device_manager.get_available_gpu_memory()
+        
+        # Estimate memory per layer
+        if len(self.wrapped_module.layers) > 0:
+            sample_layer = self.wrapped_module.layers[0]
+            layer_memory = self._estimate_layer_memory(sample_layer)
+            
+            # Check if we can fit multiple layers with activations
+            memory_per_layer_with_activations = layer_memory * 3
+            layers_that_fit = int(total_gpu_memory * 0.8 / memory_per_layer_with_activations)
+            
+            # Use chunked if we can fit at least 2 layers
+            return layers_that_fit >= 2
+        
+        return False
+    
+    def _calculate_optimal_chunk_size(self) -> int:
+        """Calculate optimal chunk size for CPU offloading."""
+        # Get available GPU memory
+        total_gpu_memory = self.device_manager.get_available_gpu_memory()
+        usable_memory = total_gpu_memory * 0.8  # Use 80% to leave room for activations
+        
+        # Estimate memory per layer
+        if hasattr(self.wrapped_module, 'layers') and len(self.wrapped_module.layers) > 0:
+            sample_layer = self.wrapped_module.layers[0]
+            layer_memory = self._estimate_layer_memory(sample_layer)
+            memory_per_layer = layer_memory * 3  # Account for activations
+            
+            chunk_size = int(usable_memory / memory_per_layer)
+            chunk_size = max(1, min(chunk_size, len(self.wrapped_module.layers)))
+            
+            print(f"  → Auto-calculated chunk size: {chunk_size} layers")
+            print(f"  → Will process model in {math.ceil(len(self.wrapped_module.layers) / chunk_size)} chunks")
+            
+            return chunk_size
+        
+        return 1
+    
+    def _setup_chunked_cpu_offload(self):
+        """Setup CPU offloading with chunked layer transfers."""
+        chunk_size = self._calculate_optimal_chunk_size()
+        cuda_devices = [torch.device(f'cuda:{d.device_id}') for d in self.device_manager.devices if d.device_type == 'cuda']
+        num_gpus = len(cuda_devices)
+        
+        def chunked_offload_forward(*args, **kwargs):
+            if isinstance(self.wrapped_module, nn.TransformerEncoder):
+                src = args[0]
+                mask = kwargs.get('mask', None)
+                src_key_padding_mask = kwargs.get('src_key_padding_mask', None)
+                
+                num_layers = len(self.wrapped_module.layers)
+                num_chunks = math.ceil(num_layers / chunk_size)
+                output = src
+                
+                for chunk_idx in range(num_chunks):
+                    start_idx = chunk_idx * chunk_size
+                    end_idx = min(start_idx + chunk_size, num_layers)
+                    
+                    # Select GPU (round-robin for multi-GPU)
+                    device = cuda_devices[chunk_idx % num_gpus] if cuda_devices else torch.device('cpu')
+                    
+                    # Move data to device
+                    output = output.to(device)
+                    if mask is not None:
+                        mask = mask.to(device)
+                    if src_key_padding_mask is not None:
+                        src_key_padding_mask = src_key_padding_mask.to(device)
+                    
+                    # Move chunk of layers to GPU
+                    for i in range(start_idx, end_idx):
+                        self.wrapped_module.layers[i] = self.wrapped_module.layers[i].to(device)
+                        self.swap_manager.swap_stats['swaps_in'] += 1
+                    
+                    # Process all layers in chunk
+                    for i in range(start_idx, end_idx):
+                        output = self.wrapped_module.layers[i](
+                            output, 
+                            src_mask=mask, 
+                            src_key_padding_mask=src_key_padding_mask
+                        )
+                    
+                    # Move layers back to CPU
+                    for i in range(start_idx, end_idx):
+                        self.wrapped_module.layers[i] = self.wrapped_module.layers[i].to('cpu')
+                        self.swap_manager.swap_stats['swaps_out'] += 1
+                    
+                    # Clear cache between chunks
+                    if chunk_idx < num_chunks - 1:
+                        torch.cuda.empty_cache()
+                
+                # Apply final norm
+                if self.wrapped_module.norm is not None:
+                    self.wrapped_module.norm = self.wrapped_module.norm.to(device)
+                    output = self.wrapped_module.norm(output)
+                    self.wrapped_module.norm = self.wrapped_module.norm.to('cpu')
+                
+                return output
+            else:
+                # Fallback for other models
+                return self._setup_sequential_cpu_offload_forward(*args, **kwargs)
+        
+        self.wrapped_module.forward = chunked_offload_forward
+    
+    def _setup_sequential_cpu_offload(self):
+        """Setup traditional sequential CPU offloading."""
+        # Get available GPUs for round-robin offloading
+        cuda_devices = [torch.device(f'cuda:{d.device_id}') for d in self.device_manager.devices if d.device_type == 'cuda']
+        num_gpus = len(cuda_devices)
+        
+        # Create the forward function
+        self.wrapped_module.forward = self._create_sequential_offload_forward(cuda_devices, num_gpus)
+    
+    def _create_sequential_offload_forward(self, cuda_devices, num_gpus):
+        """Create the sequential offload forward function."""
         # Replace with offloading forward
         def offload_forward(*args, **kwargs):
             # Special handling for TransformerEncoder
