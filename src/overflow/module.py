@@ -219,7 +219,12 @@ class DynamicMemoryModule(nn.Module):
             # Get list of GPU IDs
             device_ids = list(range(torch.cuda.device_count()))
             
-            # Wrap model with DataParallel
+            # IMPORTANT: Ensure model is on the primary device (cuda:0) before DataParallel
+            # DataParallel requires all parameters to be on device_ids[0]
+            primary_device = torch.device(f'cuda:{device_ids[0]}')
+            self.wrapped_module = self.wrapped_module.to(primary_device)
+            
+            # Now wrap with DataParallel
             self.wrapped_module = nn.DataParallel(
                 self.wrapped_module,
                 device_ids=device_ids,

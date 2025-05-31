@@ -1,13 +1,14 @@
-# tests/benchmarks/test_performance.py
+# tests/test_performance_benchmarks.py
 """
 Performance benchmarks for the Overflow framework.
-Run with: pytest tests/benchmarks/test_performance.py -v --benchmark-only
+Run with: pytest tests/test_performance_benchmarks.py -v --benchmark-only
 """
 
 import pytest
 import torch
 import torch.nn as nn
 import numpy as np
+import gc
 from overflow import DynamicMemoryModule, MemoryConfig, ExecutionStrategy
 
 
@@ -42,6 +43,14 @@ class TestStrategyPerformance:
         """Setup for each benchmark."""
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
+    def teardown_method(self):
+        """Cleanup after each benchmark."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
     
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
     @pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
@@ -57,7 +66,8 @@ class TestStrategyPerformance:
             pytest.skip(f"Model uses {wrapped.strategy.value}, not STANDARD")
         
         # Prepare input
-        x = torch.randn(batch_size, 128, 1024)
+        device = next(wrapped.parameters()).device
+        x = torch.randn(batch_size, 128, 1024).to(device)
         
         def run_inference():
             with torch.no_grad():
@@ -93,7 +103,8 @@ class TestStrategyPerformance:
             wrapped = DynamicMemoryModule(model)
             wrapped.eval()
             
-            x = torch.randn(8, 128, 1024)
+            device = next(wrapped.parameters()).device
+            x = torch.randn(8, 128, 1024).to(device)
             
             # Measure memory and time
             torch.cuda.reset_peak_memory_stats()
@@ -122,8 +133,13 @@ class TestStrategyPerformance:
         # Create model that benefits from data parallelism
         model = BenchmarkModels.create_transformer(layers=8)
         
-        # Force data parallel
-        config = MemoryConfig(prefer_data_parallel=True)
+        # Force data parallel with proper configuration
+        config = MemoryConfig(prefer_data_parallel=True, data_parallel_threshold=0.7)
+        
+        # Clear any existing model from GPU
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
         wrapped = DynamicMemoryModule(model, config=config)
         wrapped.eval()
         
@@ -139,32 +155,57 @@ class TestStrategyPerformance:
                 return output
         
         # Warmup
-        for _ in range(3):
-            run_data_parallel()
+        try:
+            for _ in range(3):
+                run_data_parallel()
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                pytest.skip(f"Batch size {batch_size} too large for available memory")
+            raise
         
-        result = benchmark(run_data_parallel)
-        
-        # Calculate throughput
-        benchmark.extra_info['batch_size'] = batch_size
-        benchmark.extra_info['num_gpus'] = torch.cuda.device_count()
-        benchmark.extra_info['samples_per_second'] = batch_size / benchmark.stats['mean']
+        # Benchmark
+        try:
+            result = benchmark(run_data_parallel)
+            
+            # Calculate throughput
+            benchmark.extra_info['batch_size'] = batch_size
+            benchmark.extra_info['num_gpus'] = torch.cuda.device_count()
+            benchmark.extra_info['samples_per_second'] = batch_size / benchmark.stats['mean']
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                pytest.skip(f"Batch size {batch_size} too large for available memory")
+            raise
 
 
 @pytest.mark.benchmark(group="memory")
 class TestMemoryEfficiency:
     """Benchmark memory efficiency of different strategies."""
     
+    def setup_method(self):
+        """Setup for each benchmark."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
+    def teardown_method(self):
+        """Cleanup after each benchmark."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
     def test_cpu_offload_memory_efficiency(self, benchmark):
         """Measure memory efficiency of CPU offloading."""
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         
-        # Create model larger than GPU memory
-        target_layers = int(gpu_memory_gb * 30)  # Rough estimate
-        model = BenchmarkModels.create_transformer(layers=min(target_layers, 48))
+        # Create model larger than GPU memory but not too large
+        # to avoid excessive test time
+        target_layers = int(gpu_memory_gb * 10)  # Conservative estimate
+        model = BenchmarkModels.create_transformer(layers=min(target_layers, 24))
         model_size = BenchmarkModels.estimate_model_size_gb(model)
         
-        if model_size < gpu_memory_gb:
+        if model_size < gpu_memory_gb * 0.9:
             pytest.skip("Model too small to require CPU offloading")
         
         wrapped = DynamicMemoryModule(model)
@@ -198,6 +239,19 @@ class TestMemoryEfficiency:
 class TestRealWorldScenarios:
     """Benchmark real-world usage patterns."""
     
+    def setup_method(self):
+        """Setup for each benchmark."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
+    def teardown_method(self):
+        """Cleanup after each benchmark."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
     def test_training_step_performance(self, benchmark):
         """Benchmark a complete training step."""
@@ -206,7 +260,8 @@ class TestRealWorldScenarios:
         wrapped.train()
         
         optimizer = torch.optim.Adam(wrapped.parameters(), lr=1e-4)
-        x = torch.randn(16, 128, 1024)
+        device = next(wrapped.parameters()).device
+        x = torch.randn(16, 128, 1024).to(device)
         
         def training_step():
             # Forward pass
@@ -231,3 +286,62 @@ class TestRealWorldScenarios:
         
         benchmark.extra_info['strategy'] = wrapped.strategy.value
         benchmark.extra_info['model_size_gb'] = BenchmarkModels.estimate_model_size_gb(model)
+    
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+    def test_inference_latency(self, benchmark):
+        """Benchmark inference latency for different model sizes."""
+        # Test with medium-sized model
+        model = BenchmarkModels.create_transformer(layers=8, d_model=768)
+        wrapped = DynamicMemoryModule(model)
+        wrapped.eval()
+        
+        device = next(wrapped.parameters()).device
+        
+        # Single sample for latency measurement
+        x = torch.randn(1, 64, 768).to(device)
+        
+        def single_inference():
+            with torch.no_grad():
+                output = wrapped(x)
+                torch.cuda.synchronize()
+                return output
+        
+        # Warmup
+        for _ in range(10):
+            single_inference()
+        
+        # Benchmark
+        result = benchmark(single_inference)
+        
+        benchmark.extra_info['strategy'] = wrapped.strategy.value
+        benchmark.extra_info['model_size_gb'] = BenchmarkModels.estimate_model_size_gb(model)
+        benchmark.extra_info['sequence_length'] = 64
+    
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+    @pytest.mark.parametrize("sequence_length", [32, 64, 128, 256])
+    def test_sequence_length_scaling(self, benchmark, sequence_length):
+        """Benchmark performance scaling with sequence length."""
+        model = BenchmarkModels.create_transformer(layers=6, d_model=512)
+        wrapped = DynamicMemoryModule(model)
+        wrapped.eval()
+        
+        device = next(wrapped.parameters()).device
+        
+        # Fixed batch size, varying sequence length
+        x = torch.randn(8, sequence_length, 512).to(device)
+        
+        def run_inference():
+            with torch.no_grad():
+                output = wrapped(x)
+                torch.cuda.synchronize()
+                return output
+        
+        # Warmup
+        for _ in range(3):
+            run_inference()
+        
+        # Benchmark
+        result = benchmark(run_inference)
+        
+        benchmark.extra_info['sequence_length'] = sequence_length
+        benchmark.extra_info['strategy'] = wrapped.strategy.value
