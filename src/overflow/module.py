@@ -6,6 +6,7 @@ Main DynamicMemoryModule implementation for the Overflow framework.
 import torch
 import torch.nn as nn
 import warnings
+import logging
 from typing import Dict, Optional, Any, Tuple
 
 from .enums import ExecutionStrategy
@@ -17,13 +18,28 @@ from .swap_manager import BlockSwapManager
 from .partitioner import ModelPartitioner
 
 
+# Set up logging
+logger = logging.getLogger(__name__)
+
+
 class DynamicMemoryModule(nn.Module):
     """Enhanced nn.Module with dynamic memory management."""
     
     def __init__(self, module: nn.Module, config: Optional[MemoryConfig] = None):
         super().__init__()
+        
+        # Initialize tracking attributes FIRST before anything else
+        self._pre_forward_memory = {}
+        self._last_chunk_calculation = None
+        
         self.wrapped_module = module
         self.config = config or MemoryConfig()
+        
+        # Set up logging based on config
+        if self.config.verbose:
+            logger.setLevel(logging.INFO)
+        else:
+            logger.setLevel(logging.WARNING)
         
         # Initialize components
         self.memory_profiler = MemoryProfiler(self.config)
@@ -42,8 +58,7 @@ class DynamicMemoryModule(nn.Module):
         # Setup based on strategy
         self._setup_execution()
         
-        # Memory tracking
-        self._pre_forward_memory = {}
+        # Register hooks if profiling enabled
         
         # Register hooks if profiling enabled
         if self.config.enable_profiling:
@@ -90,24 +105,20 @@ class DynamicMemoryModule(nn.Module):
                     single_gpu_memory = d.total_memory
                     break
         
-        # Print diagnostic info
-        # Use appropriate units for model size
-        model_size_gb = model_size / 1024**3
-        if model_size_gb < 1.0:
-            model_size_mb = model_size / 1024**2
-            print(f"Model size estimate: {model_size_mb:.1f} MB")
-        else:
-            print(f"Model size estimate: {model_size_gb:.2f} GB")
-        
-        print(f"Total GPU memory: {total_gpu_memory / 1024**3:.2f} GB")
-        if gpu_count > 1:
-            print(f"Single GPU memory: {single_gpu_memory / 1024**3:.2f} GB")
-            print(f"Number of GPUs: {gpu_count}")
+        # Log diagnostic info if verbose
+        if self.config.verbose:
+            model_size_gb = model_size / 1024**3
+            logger.info(f"Model size estimate: {model_size_gb:.2f} GB")
+            logger.info(f"Total GPU memory: {total_gpu_memory / 1024**3:.2f} GB")
+            if gpu_count > 1:
+                logger.info(f"Single GPU memory: {single_gpu_memory / 1024**3:.2f} GB")
+                logger.info(f"Number of GPUs: {gpu_count}")
         
         # Decision logic
         if total_gpu_memory == 0:
             # No GPU available
-            print("→ No GPU detected, using CPU execution")
+            if self.config.verbose:
+                logger.info("→ No GPU detected, using CPU execution")
             return ExecutionStrategy.CPU_OFFLOAD
         
         # Account for activation memory (roughly 2-3x model size during training)
@@ -118,13 +129,16 @@ class DynamicMemoryModule(nn.Module):
         # Single-GPU scenarios
         if gpu_count == 1:
             if total_memory_needed < single_gpu_memory * 0.8:
-                print("→ Model fits comfortably on single GPU")
+                if self.config.verbose:
+                    logger.info("→ Model fits comfortably on single GPU")
                 return ExecutionStrategy.STANDARD
             elif model_size < single_gpu_memory * 0.8:
-                print("→ Model fits but activations might not, using gradient checkpointing")
+                if self.config.verbose:
+                    logger.info("→ Model fits but activations might not, using gradient checkpointing")
                 return ExecutionStrategy.GRADIENT_CHECKPOINT
             else:
-                print("→ Model too large for GPU, using CPU offloading")
+                if self.config.verbose:
+                    logger.info("→ Model too large for GPU, using CPU offloading")
                 return ExecutionStrategy.CPU_OFFLOAD
         
         # Multi-GPU scenarios
@@ -139,28 +153,32 @@ class DynamicMemoryModule(nn.Module):
             prefer_data_parallel = self.config.prefer_data_parallel if hasattr(self.config, 'prefer_data_parallel') else False
             
             if model_size < single_gpu_memory * data_parallel_threshold and (not self.training or prefer_data_parallel):
-                print("→ Small model on multi-GPU, using data parallelism for potential speedup")
-                print("  Note: Speedup depends on batch size (larger batches benefit more)")
+                if self.config.verbose:
+                    logger.info("→ Small model on multi-GPU, using data parallelism for potential speedup")
                 return ExecutionStrategy.DATA_PARALLEL
             
             # Case 2: Model fits comfortably on single GPU
             elif total_memory_needed < single_gpu_memory * 0.8:
-                print("→ Model fits comfortably on single GPU with standard execution")
+                if self.config.verbose:
+                    logger.info("→ Model fits comfortably on single GPU with standard execution")
                 return ExecutionStrategy.STANDARD
             
             # Case 3: Model fits on single GPU with checkpointing
             elif model_size < single_gpu_memory * 0.8:
-                print("→ Model fits on single GPU with gradient checkpointing")
+                if self.config.verbose:
+                    logger.info("→ Model fits on single GPU with gradient checkpointing")
                 return ExecutionStrategy.GRADIENT_CHECKPOINT
             
             # Case 4: Model doesn't fit on single GPU but fits across all GPUs
             elif model_size < total_gpu_memory * 0.8:
-                print("→ Model too large for single GPU, using model parallelism")
+                if self.config.verbose:
+                    logger.info("→ Model too large for single GPU, using model parallelism")
                 return ExecutionStrategy.MODEL_PARALLEL
             
             # Case 5: Model too large even for all GPUs - CPU offload with multi-GPU support
             else:
-                print("→ Model too large for all GPUs, using CPU offloading with multi-GPU acceleration")
+                if self.config.verbose:
+                    logger.info("→ Model too large for all GPUs, using CPU offloading with multi-GPU acceleration")
                 return ExecutionStrategy.CPU_OFFLOAD
     
     def _estimate_model_size(self) -> int:
@@ -238,11 +256,6 @@ class DynamicMemoryModule(nn.Module):
                 device_ids=device_ids,
                 output_device=device_ids[0]
             )
-            
-            print(f"  Using GPUs: {device_ids}")
-            print(f"  Batch will be split across {len(device_ids)} GPUs")
-        else:
-            print("  Warning: Data parallel requested but only 1 GPU available")
     
     def _setup_model_parallel(self):
         """Setup model parallelism across available GPUs."""
@@ -312,15 +325,47 @@ class DynamicMemoryModule(nn.Module):
         except:
             return 0
     
-    def _estimate_layer_memory(self, layer: nn.Module) -> int:
+    def _estimate_layer_memory(self, layer: nn.Module, batch_size: int = 1, seq_length: int = 128) -> int:
         """Estimate memory required for a layer in bytes."""
-        total_size = 0
+        # Count parameters and buffers
+        param_size = 0
         for param in layer.parameters():
-            total_size += param.numel() * param.element_size()
+            param_size += param.numel() * param.element_size()
         for buffer in layer.buffers():
-            total_size += buffer.numel() * buffer.element_size()
-        # Add some overhead for activations (conservative estimate)
-        return int(total_size * 2)
+            param_size += buffer.numel() * buffer.element_size()
+        
+        # Estimate activation memory based on layer type
+        if isinstance(layer, nn.TransformerEncoderLayer):
+            # Get layer dimensions
+            d_model = layer.self_attn.embed_dim
+            nhead = layer.self_attn.num_heads
+            ff_dim = layer.linear1.out_features
+            
+            # Calculate activation memory for batch_size and seq_length
+            # Input/output: batch_size * seq_length * d_model
+            io_memory = batch_size * seq_length * d_model * 4  # float32
+            
+            # Self-attention intermediates (Q, K, V): 3 * batch_size * seq_length * d_model
+            attention_memory = 3 * batch_size * seq_length * d_model * 4
+            
+            # Attention scores: batch_size * nhead * seq_length * seq_length
+            scores_memory = batch_size * nhead * seq_length * seq_length * 4
+            
+            # FFN intermediate: batch_size * seq_length * ff_dim
+            ffn_memory = batch_size * seq_length * ff_dim * 4
+            
+            # Total activation memory
+            activation_memory = io_memory + attention_memory + scores_memory + ffn_memory
+            
+            # For inference, we need parameters + activations
+            total_memory = param_size + activation_memory
+            
+            # Add 20% overhead for temporary buffers
+            return int(total_memory * 1.2)
+        else:
+            # For other layers, use parameter size + reasonable activation estimate
+            # Assume activations are proportional to output size
+            return int(param_size * 1.5)
     
     def _setup_cpu_offload(self):
         """Setup CPU offloading for large models."""
@@ -335,10 +380,13 @@ class DynamicMemoryModule(nn.Module):
         use_chunked = self._should_use_chunked_offloading()
         
         if use_chunked:
-            print("  → Using optimized chunked CPU offloading for better performance")
+            if self.config.verbose:
+                logger.info("  → Using optimized chunked CPU offloading for better performance")
+                logger.info("  → Chunk size will be optimized based on input dimensions")
             self._setup_chunked_cpu_offload()
         else:
-            print("  → Using sequential CPU offloading")
+            if self.config.verbose:
+                logger.info("  → Using sequential CPU offloading")
             self._setup_sequential_cpu_offload()
     
     def _should_use_chunked_offloading(self) -> bool:
@@ -353,34 +401,88 @@ class DynamicMemoryModule(nn.Module):
         # Estimate memory per layer
         if len(self.wrapped_module.layers) > 0:
             sample_layer = self.wrapped_module.layers[0]
-            layer_memory = self._estimate_layer_memory(sample_layer)
+            # Use conservative estimates for deciding if chunking is beneficial
+            layer_memory = self._estimate_layer_memory(sample_layer, batch_size=1, seq_length=128)
             
-            # Check if we can fit multiple layers with activations
-            memory_per_layer_with_activations = layer_memory * 3
-            layers_that_fit = int(total_gpu_memory * 0.8 / memory_per_layer_with_activations)
+            # Check if we can fit multiple layers
+            layers_that_fit = int(total_gpu_memory * 0.8 / layer_memory)
             
             # Use chunked if we can fit at least 2 layers
             return layers_that_fit >= 2
         
         return False
     
-    def _calculate_optimal_chunk_size(self) -> int:
+    def _calculate_optimal_chunk_size(self, batch_size: int = 1, seq_length: int = 128) -> int:
         """Calculate optimal chunk size for CPU offloading."""
-        # Get available GPU memory
-        total_gpu_memory = self.device_manager.get_available_gpu_memory()
-        usable_memory = total_gpu_memory * 0.8  # Use 80% to leave room for activations
+        # Get available GPU memory for ALL GPUs
+        cuda_devices = [d for d in self.device_manager.devices if d.device_type == 'cuda']
+        num_gpus = len(cuda_devices)
         
-        # Estimate memory per layer
+        if num_gpus == 0:
+            return 1
+        
+        # For multi-GPU, we can be more aggressive since we can use both simultaneously
+        total_available_memory = 0
+        min_available_memory = float('inf')
+        for device in cuda_devices:
+            # Get fresh available memory for each GPU
+            free_memory = self._get_available_gpu_memory(device.device_id)
+            total_available_memory += free_memory
+            min_available_memory = min(min_available_memory, free_memory)
+        
+        # Use 95% of the minimum available GPU memory (very aggressive)
+        # We use the minimum to ensure we don't OOM on any GPU
+        usable_memory_per_gpu = min_available_memory * 0.95
+        
+        # Estimate memory per layer more accurately with actual batch/seq dimensions
         if hasattr(self.wrapped_module, 'layers') and len(self.wrapped_module.layers) > 0:
             sample_layer = self.wrapped_module.layers[0]
-            layer_memory = self._estimate_layer_memory(sample_layer)
-            memory_per_layer = layer_memory * 3  # Account for activations
+            layer_memory = self._estimate_layer_memory(sample_layer, batch_size, seq_length)
             
-            chunk_size = int(usable_memory / memory_per_layer)
+            # Calculate chunk size based on available memory
+            chunk_size = int(usable_memory_per_gpu / layer_memory)
+            
+            # For multi-GPU, we want chunks that allow efficient parallel processing
+            if num_gpus > 1:
+                total_layers = len(self.wrapped_module.layers)
+                # Try to make the number of chunks divisible by num_gpus for even distribution
+                ideal_num_chunks = max(1, math.ceil(total_layers / chunk_size))
+                if ideal_num_chunks % num_gpus != 0:
+                    # Adjust to nearest multiple of num_gpus
+                    ideal_num_chunks = math.ceil(ideal_num_chunks / num_gpus) * num_gpus
+                    chunk_size = math.ceil(total_layers / ideal_num_chunks)
+            
+            # Ensure chunk size is valid
             chunk_size = max(1, min(chunk_size, len(self.wrapped_module.layers)))
             
-            print(f"  → Auto-calculated chunk size: {chunk_size} layers")
-            print(f"  → Will process model in {math.ceil(len(self.wrapped_module.layers) / chunk_size)} chunks")
+            # Log detailed information if verbose
+            if self.config.verbose:
+                # Calculate parameter size for logging
+                param_size = 0
+                for param in sample_layer.parameters():
+                    param_size += param.numel() * param.element_size()
+                for buffer in sample_layer.buffers():
+                    param_size += buffer.numel() * buffer.element_size()
+                
+                logger.info("  → Memory calculation details:")
+                logger.info(f"    - Available GPU memory: {total_available_memory / 1024**3:.1f} GB total ({num_gpus} GPUs)")
+                logger.info(f"    - Min available per GPU: {min_available_memory / 1024**3:.1f} GB")
+                logger.info(f"    - Usable memory per GPU: {usable_memory_per_gpu / 1024**3:.1f} GB (95% of available)")
+                logger.info(f"    - Layer parameter size: {param_size / 1024**2:.1f} MB")
+                logger.info(f"    - Layer total memory (batch={batch_size}, seq={seq_length}): {layer_memory / 1024**2:.1f} MB")
+                logger.info(f"  → Optimal chunk size: {chunk_size} layers")
+                logger.info(f"  → Will process model in {math.ceil(len(self.wrapped_module.layers) / chunk_size)} chunks")
+                logger.info(f"  → Expected GPU usage: ~{(chunk_size * layer_memory) / 1024**3:.1f} GB per GPU")
+            
+            # Store memory info for later use if needed
+            self._last_chunk_calculation = {
+                'total_available_memory': total_available_memory,
+                'min_available_memory': min_available_memory,
+                'usable_memory_per_gpu': usable_memory_per_gpu,
+                'layer_memory': layer_memory,
+                'chunk_size': chunk_size,
+                'num_chunks': math.ceil(len(self.wrapped_module.layers) / chunk_size)
+            }
             
             return chunk_size
         
@@ -388,7 +490,6 @@ class DynamicMemoryModule(nn.Module):
     
     def _setup_chunked_cpu_offload(self):
         """Setup CPU offloading with chunked layer transfers."""
-        chunk_size = self._calculate_optimal_chunk_size()
         cuda_devices = [torch.device(f'cuda:{d.device_id}') for d in self.device_manager.devices if d.device_type == 'cuda']
         num_gpus = len(cuda_devices)
         
@@ -398,48 +499,124 @@ class DynamicMemoryModule(nn.Module):
                 mask = kwargs.get('mask', None)
                 src_key_padding_mask = kwargs.get('src_key_padding_mask', None)
                 
+                # Get actual batch size and sequence length from input
+                batch_size = src.size(0)
+                seq_length = src.size(1)
+                
+                # Calculate optimal chunk size based on actual input dimensions
+                chunk_size = self._calculate_optimal_chunk_size(batch_size, seq_length)
+                
                 num_layers = len(self.wrapped_module.layers)
                 num_chunks = math.ceil(num_layers / chunk_size)
-                output = src
                 
-                for chunk_idx in range(num_chunks):
-                    start_idx = chunk_idx * chunk_size
-                    end_idx = min(start_idx + chunk_size, num_layers)
+                # For multi-GPU, we can process multiple chunks simultaneously
+                if num_gpus > 1 and batch_size == 1:  # Single batch, can't split batch
+                    if self.config.verbose:
+                        logger.info(f"\n🔄 Processing {num_layers} layers in {num_chunks} chunks using {num_gpus} GPUs...")
                     
-                    # Select GPU (round-robin for multi-GPU)
-                    device = cuda_devices[chunk_idx % num_gpus] if cuda_devices else torch.device('cpu')
+                    output = src
+                    for chunk_base_idx in range(0, num_chunks, num_gpus):
+                        # Process up to num_gpus chunks in parallel
+                        parallel_chunks = []
+                        
+                        for gpu_offset in range(num_gpus):
+                            chunk_idx = chunk_base_idx + gpu_offset
+                            if chunk_idx >= num_chunks:
+                                break
+                            
+                            start_idx = chunk_idx * chunk_size
+                            end_idx = min(start_idx + chunk_size, num_layers)
+                            device = cuda_devices[gpu_offset]
+                            
+                            parallel_chunks.append({
+                                'start': start_idx,
+                                'end': end_idx,
+                                'device': device,
+                                'chunk_idx': chunk_idx
+                            })
+                        
+                        # Move layers to GPUs in parallel
+                        for chunk_info in parallel_chunks:
+                            if self.config.verbose:
+                                logger.info(f"  Loading chunk {chunk_info['chunk_idx'] + 1}/{num_chunks} on GPU {chunk_info['device'].index}")
+                            for i in range(chunk_info['start'], chunk_info['end']):
+                                self.wrapped_module.layers[i] = self.wrapped_module.layers[i].to(chunk_info['device'])
+                                self.swap_manager.swap_stats['swaps_in'] += 1
+                        
+                        # Process each chunk sequentially (can't parallelize single batch)
+                        for chunk_info in parallel_chunks:
+                            device = chunk_info['device']
+                            
+                            # Move data to device
+                            output = output.to(device)
+                            if mask is not None:
+                                mask = mask.to(device)
+                            if src_key_padding_mask is not None:
+                                src_key_padding_mask = src_key_padding_mask.to(device)
+                            
+                            # Process layers in this chunk
+                            for i in range(chunk_info['start'], chunk_info['end']):
+                                output = self.wrapped_module.layers[i](
+                                    output,
+                                    src_mask=mask,
+                                    src_key_padding_mask=src_key_padding_mask
+                                )
+                        
+                        # Move layers back to CPU
+                        for chunk_info in parallel_chunks:
+                            for i in range(chunk_info['start'], chunk_info['end']):
+                                self.wrapped_module.layers[i] = self.wrapped_module.layers[i].to('cpu')
+                                self.swap_manager.swap_stats['swaps_out'] += 1
+                        
+                        # Clear cache on all GPUs
+                        for device in cuda_devices:
+                            with torch.cuda.device(device):
+                                torch.cuda.empty_cache()
+                
+                else:
+                    # Single GPU or batch size > 1 (can split batch)
+                    output = src
                     
-                    # Move data to device
-                    output = output.to(device)
-                    if mask is not None:
-                        mask = mask.to(device)
-                    if src_key_padding_mask is not None:
-                        src_key_padding_mask = src_key_padding_mask.to(device)
-                    
-                    # Move chunk of layers to GPU
-                    for i in range(start_idx, end_idx):
-                        self.wrapped_module.layers[i] = self.wrapped_module.layers[i].to(device)
-                        self.swap_manager.swap_stats['swaps_in'] += 1
-                    
-                    # Process all layers in chunk
-                    for i in range(start_idx, end_idx):
-                        output = self.wrapped_module.layers[i](
-                            output, 
-                            src_mask=mask, 
-                            src_key_padding_mask=src_key_padding_mask
-                        )
-                    
-                    # Move layers back to CPU
-                    for i in range(start_idx, end_idx):
-                        self.wrapped_module.layers[i] = self.wrapped_module.layers[i].to('cpu')
-                        self.swap_manager.swap_stats['swaps_out'] += 1
-                    
-                    # Clear cache between chunks
-                    if chunk_idx < num_chunks - 1:
-                        torch.cuda.empty_cache()
+                    for chunk_idx in range(num_chunks):
+                        start_idx = chunk_idx * chunk_size
+                        end_idx = min(start_idx + chunk_size, num_layers)
+                        
+                        # Select GPU (round-robin for single GPU path)
+                        device = cuda_devices[chunk_idx % num_gpus] if cuda_devices else torch.device('cpu')
+                        
+                        # Move data to device
+                        output = output.to(device)
+                        if mask is not None:
+                            mask = mask.to(device)
+                        if src_key_padding_mask is not None:
+                            src_key_padding_mask = src_key_padding_mask.to(device)
+                        
+                        # Move chunk of layers to GPU
+                        for i in range(start_idx, end_idx):
+                            self.wrapped_module.layers[i] = self.wrapped_module.layers[i].to(device)
+                            self.swap_manager.swap_stats['swaps_in'] += 1
+                        
+                        # Process all layers in chunk
+                        for i in range(start_idx, end_idx):
+                            output = self.wrapped_module.layers[i](
+                                output, 
+                                src_mask=mask, 
+                                src_key_padding_mask=src_key_padding_mask
+                            )
+                        
+                        # Move layers back to CPU
+                        for i in range(start_idx, end_idx):
+                            self.wrapped_module.layers[i] = self.wrapped_module.layers[i].to('cpu')
+                            self.swap_manager.swap_stats['swaps_out'] += 1
+                        
+                        # Clear cache between chunks
+                        if chunk_idx < num_chunks - 1:
+                            torch.cuda.empty_cache()
                 
                 # Apply final norm
                 if self.wrapped_module.norm is not None:
+                    # Use the device where output currently is
+                    device = output.device
                     self.wrapped_module.norm = self.wrapped_module.norm.to(device)
                     output = self.wrapped_module.norm(output)
                     self.wrapped_module.norm = self.wrapped_module.norm.to('cpu')
@@ -447,7 +624,7 @@ class DynamicMemoryModule(nn.Module):
                 return output
             else:
                 # Fallback for other models
-                return self._setup_sequential_cpu_offload_forward(*args, **kwargs)
+                return self._create_sequential_offload_forward(cuda_devices, num_gpus)(*args, **kwargs)
         
         self.wrapped_module.forward = chunked_offload_forward
     
@@ -586,7 +763,6 @@ class DynamicMemoryModule(nn.Module):
                                 available_memory = self._get_available_gpu_memory(device.index)
                                 if available_memory < required_memory:
                                     # Last resort: process on CPU if GPU is too fragmented
-                                    print(f"Warning: Layer {i} too large for GPU ({required_memory/1024**2:.1f}MB > {available_memory/1024**2:.1f}MB available), processing on CPU")
                                     # Process this layer on CPU
                                     output = mod(output.cpu(), src_mask=mask.cpu() if mask is not None else None, 
                                                src_key_padding_mask=src_key_padding_mask.cpu() if src_key_padding_mask is not None else None)
@@ -828,14 +1004,40 @@ class DynamicMemoryModule(nn.Module):
         """Delegate attribute setting appropriately."""
         if name in ['wrapped_module', 'config', 'memory_profiler', 'device_manager', 
                     'swap_manager', 'strategy', 'partitioner', '_pre_forward_memory', '_original_forward',
-                    'training', 'layer_devices']:
+                    'training', 'layer_devices', '_last_chunk_calculation']:
             super().__setattr__(name, value)
         else:
             setattr(self.wrapped_module, name, value)
     
-    def get_memory_stats(self) -> Dict[str, Any]:
+
+    
+    def get_strategy_info(self) -> Dict[str, Any]:
+        """Get information about the strategy selection and configuration."""
+        model_size = self._estimate_model_size()
+        total_gpu_memory = self.device_manager.get_total_gpu_memory()
+        gpu_count = len([d for d in self.device_manager.devices if d.device_type == 'cuda'])
+        
+        info = {
+            'strategy': self.strategy.value,
+            'model_size_gb': model_size / 1024**3,
+            'total_gpu_memory_gb': total_gpu_memory / 1024**3,
+            'gpu_count': gpu_count
+        }
+        
+        if gpu_count > 0:
+            primary_device_id = int(self.device_manager.primary_device.index) if self.device_manager.primary_device.type == 'cuda' else 0
+            for d in self.device_manager.devices:
+                if d.device_type == 'cuda' and d.device_id == primary_device_id:
+                    info['single_gpu_memory_gb'] = d.total_memory / 1024**3
+                    break
+        
+        # Add strategy-specific information
+        if self.strategy == ExecutionStrategy.CPU_OFFLOAD:
+            info['uses_chunked_offloading'] = self._should_use_chunked_offloading()
+        
+        return info
         """Get current memory statistics."""
-        return {
+        stats = {
             'strategy': self.strategy.value,
             'peak_memory_mb': self.memory_profiler.peak_memory,
             'module_stats': self.memory_profiler.memory_stats,
@@ -851,3 +1053,70 @@ class DynamicMemoryModule(nn.Module):
                 for d in self.device_manager.devices
             ]
         }
+        
+        # Include chunk calculation info if available
+        if hasattr(self, '_last_chunk_calculation') and self._last_chunk_calculation is not None:
+            stats['chunk_info'] = {
+                'chunk_size': self._last_chunk_calculation['chunk_size'],
+                'num_chunks': self._last_chunk_calculation['num_chunks'],
+                'layer_memory_mb': self._last_chunk_calculation['layer_memory'] / 1024**2,
+                'expected_gpu_usage_gb': (self._last_chunk_calculation['chunk_size'] * 
+                                         self._last_chunk_calculation['layer_memory']) / 1024**3
+            }
+        
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Get current memory statistics."""
+        stats = {
+            'strategy': self.strategy.value,
+            'peak_memory_mb': self.memory_profiler.peak_memory,
+            'module_stats': self.memory_profiler.memory_stats,
+            'swap_stats': self.swap_manager.swap_stats if hasattr(self.swap_manager, 'swap_stats') else {},
+            'devices': [
+                {
+                    'type': d.device_type,
+                    'id': d.device_id,
+                    'name': d.device_name,
+                    'total_memory_mb': d.total_memory / 1024**2,
+                    'available_memory_mb': d.available_memory / 1024**2
+                }
+                for d in self.device_manager.devices
+            ]
+        }
+        
+        # Include chunk calculation info if available
+        if hasattr(self, '_last_chunk_calculation'):
+            stats['chunk_info'] = {
+                'chunk_size': self._last_chunk_calculation['chunk_size'],
+                'num_chunks': self._last_chunk_calculation['num_chunks'],
+                'layer_memory_mb': self._last_chunk_calculation['layer_memory'] / 1024**2,
+                'expected_gpu_usage_gb': (self._last_chunk_calculation['chunk_size'] * 
+                                         self._last_chunk_calculation['layer_memory']) / 1024**3
+            }
+        
+        return stats
+    
+    def get_strategy_info(self) -> Dict[str, Any]:
+        """Get information about the strategy selection and configuration."""
+        model_size = self._estimate_model_size()
+        total_gpu_memory = self.device_manager.get_total_gpu_memory()
+        gpu_count = len([d for d in self.device_manager.devices if d.device_type == 'cuda'])
+        
+        info = {
+            'strategy': self.strategy.value,
+            'model_size_gb': model_size / 1024**3,
+            'total_gpu_memory_gb': total_gpu_memory / 1024**3,
+            'gpu_count': gpu_count
+        }
+        
+        if gpu_count > 0:
+            primary_device_id = int(self.device_manager.primary_device.index) if self.device_manager.primary_device.type == 'cuda' else 0
+            for d in self.device_manager.devices:
+                if d.device_type == 'cuda' and d.device_id == primary_device_id:
+                    info['single_gpu_memory_gb'] = d.total_memory / 1024**3
+                    break
+        
+        # Add strategy-specific information
+        if self.strategy == ExecutionStrategy.CPU_OFFLOAD:
+            info['uses_chunked_offloading'] = self._should_use_chunked_offloading()
+        
+        return info

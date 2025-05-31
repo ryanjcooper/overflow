@@ -1,21 +1,17 @@
 # examples/test_60gb_model.py
 """
 Test running a 60GB model with Overflow.
-This demonstrates both sequential and chunked CPU offloading strategies.
-
-New in this version:
-- Automatic optimization (default): Detects when chunked offloading would help
-- Manual strategies still available for testing and comparison
+This demonstrates how Overflow automatically optimizes CPU offloading for large models.
 
 Usage:
-    # Automatic optimization (recommended - just wrap and run!)
+    # Run with automatic optimization (recommended)
     python test_60gb_model.py
     
-    # Compare different strategies
-    python test_60gb_model.py --strategy compare
+    # Run quick test with smaller model
+    python test_60gb_model.py --quick
     
-    # Force specific strategy
-    python test_60gb_model.py --strategy chunked --chunk-size 25
+    # Force run even with low RAM (not recommended)
+    python test_60gb_model.py --force
 """
 
 import torch
@@ -23,8 +19,15 @@ import torch.nn as nn
 import psutil
 import time
 import gc
-import math
+import logging
 from overflow import DynamicMemoryModule, MemoryConfig, ExecutionStrategy
+
+
+# Configure logging for the example
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s:%(name)s:%(message)s'
+)
 
 
 def format_bytes(bytes_value):
@@ -131,164 +134,10 @@ def check_system_requirements():
     return True
 
 
-def create_auto_optimized_wrapper(model, base_config=None):
-    """
-    Create an automatically optimized wrapper that uses chunked offloading when beneficial.
-    This demonstrates what would be built into the framework.
-    """
-    # Create base config if not provided
-    if base_config is None:
-        base_config = MemoryConfig(
-            checkpoint_threshold=0.5,
-            offload_threshold=0.6,
-            prefetch_size=1,
-            min_gpu_memory_mb=4096,
-            enable_profiling=True
-        )
-    
-    # Wrap with standard Overflow
-    wrapped = DynamicMemoryModule(model, base_config)
-    
-    # If CPU offloading was selected, check if chunked would be beneficial
-    if wrapped.strategy == ExecutionStrategy.CPU_OFFLOAD:
-        # Check if model supports chunking and if we have enough GPU memory
-        if hasattr(wrapped.wrapped_module, 'layers') and len(wrapped.wrapped_module.layers) > 0:
-            # Calculate if chunking would help
-            total_gpu_memory = wrapped.device_manager.get_available_gpu_memory()
-            sample_layer = wrapped.wrapped_module.layers[0]
-            layer_memory = wrapped._estimate_layer_memory(sample_layer)
-            memory_per_layer = layer_memory * 3  # With activations
-            
-            layers_that_fit = int(total_gpu_memory * 0.8 / memory_per_layer)
-            
-            if layers_that_fit >= 2:  # Can fit at least 2 layers
-                print("\n🚀 Auto-Optimization: Detected that chunked offloading will improve performance!")
-                print(f"  → Can fit {layers_that_fit} layers at once instead of 1")
-                print(f"  → Expected speedup: {min(layers_that_fit, len(wrapped.wrapped_module.layers))}x")
-                
-                # Apply chunked offloading
-                wrapped, chunk_size = add_chunked_offloading(wrapped)
-                wrapped._optimized_mode = "chunked"
-                wrapped._chunk_size = chunk_size
-            else:
-                wrapped._optimized_mode = "sequential"
-                wrapped._chunk_size = 1
-        else:
-            wrapped._optimized_mode = "sequential"
-            wrapped._chunk_size = 1
-    else:
-        wrapped._optimized_mode = "none"
-        wrapped._chunk_size = 0
-    
-    return wrapped
-    """
-    Modify the wrapped model to use chunked CPU offloading.
-    This is a demonstration - in production, this would be built into the framework.
-    """
-    if not hasattr(wrapped_model.wrapped_module, 'layers'):
-        print("Model doesn't have layers attribute, can't apply chunking")
-        return wrapped_model, 1
-    
-    # Get layer memory estimate first
-    sample_layer = wrapped_model.wrapped_module.layers[0]
-    layer_memory = wrapped_model._estimate_layer_memory(sample_layer)
-    
-    # Calculate optimal chunk size if not provided
-    if chunk_size is None:
-        # Get available GPU memory
-        total_gpu_memory = wrapped_model.device_manager.get_available_gpu_memory()
-        usable_memory = total_gpu_memory * 0.8  # Use 80% of GPU memory
-        
-        memory_per_layer = layer_memory * 3  # Account for activations
-        
-        chunk_size = int(usable_memory / memory_per_layer)
-        chunk_size = max(1, min(chunk_size, len(wrapped_model.wrapped_module.layers)))
-    
-    print(f"\n📦 Chunked Offloading Configuration:")
-    print(f"  - Chunk size: {chunk_size} layers")
-    print(f"  - Number of chunks: {math.ceil(len(wrapped_model.wrapped_module.layers) / chunk_size)}")
-    print(f"  - Expected GPU usage: ~{(chunk_size * layer_memory * 3) / 1024**3:.1f} GB")
-    
-    # Store original forward
-    original_forward = wrapped_model.wrapped_module.forward
-    
-    def chunked_forward(*args, **kwargs):
-        """Forward pass with chunked layer loading."""
-        src = args[0]
-        mask = kwargs.get('mask', None)
-        src_key_padding_mask = kwargs.get('src_key_padding_mask', None)
-        
-        # Get device
-        device = wrapped_model.device_manager.primary_device
-        
-        # Process layers in chunks
-        num_layers = len(wrapped_model.wrapped_module.layers)
-        num_chunks = math.ceil(num_layers / chunk_size)
-        output = src
-        
-        print(f"\n🔄 Processing {num_layers} layers in {num_chunks} chunks...")
-        
-        for chunk_idx in range(num_chunks):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min(start_idx + chunk_size, num_layers)
-            chunk_layers = range(start_idx, end_idx)
-            
-            print(f"  Chunk {chunk_idx + 1}/{num_chunks}: layers {start_idx}-{end_idx-1}", end="", flush=True)
-            
-            # Move chunk to GPU
-            chunk_start_time = time.time()
-            for i in chunk_layers:
-                wrapped_model.wrapped_module.layers[i] = wrapped_model.wrapped_module.layers[i].to(device)
-                wrapped_model.swap_manager.swap_stats['swaps_in'] += 1
-            
-            # Move data to device if needed
-            if output.device != device:
-                output = output.to(device)
-            if mask is not None and mask.device != device:
-                mask = mask.to(device)
-            if src_key_padding_mask is not None and src_key_padding_mask.device != device:
-                src_key_padding_mask = src_key_padding_mask.to(device)
-            
-            # Process all layers in chunk
-            for i in chunk_layers:
-                output = wrapped_model.wrapped_module.layers[i](
-                    output, 
-                    src_mask=mask, 
-                    src_key_padding_mask=src_key_padding_mask
-                )
-            
-            # Move chunk back to CPU
-            for i in chunk_layers:
-                wrapped_model.wrapped_module.layers[i] = wrapped_model.wrapped_module.layers[i].to('cpu')
-                wrapped_model.swap_manager.swap_stats['swaps_out'] += 1
-            
-            chunk_time = time.time() - chunk_start_time
-            print(f" - {chunk_time:.1f}s")
-            
-            # Clear cache between chunks
-            if chunk_idx < num_chunks - 1:
-                torch.cuda.empty_cache()
-        
-        # Apply final norm
-        if wrapped_model.wrapped_module.norm is not None:
-            wrapped_model.wrapped_module.norm = wrapped_model.wrapped_module.norm.to(device)
-            output = wrapped_model.wrapped_module.norm(output)
-            wrapped_model.wrapped_module.norm = wrapped_model.wrapped_module.norm.to('cpu')
-        
-        return output
-    
-    # Replace forward method
-    wrapped_model.wrapped_module.forward = chunked_forward
-
-
-
-def run_60gb_model_test(strategy="sequential", chunk_size=None):
-    """Run the 60GB model test with specified strategy."""
+def run_60gb_model_test():
+    """Run the 60GB model test with automatic optimization."""
     print("="*70)
-    if strategy == "auto":
-        print("60GB Model Test - Automatic Optimization")
-    else:
-        print(f"60GB Model Test - {strategy.capitalize()} CPU Offloading")
+    print("60GB Model Test - Automatic Optimization")
     print("="*70)
     print()
     
@@ -322,44 +171,41 @@ def run_60gb_model_test(strategy="sequential", chunk_size=None):
         offload_threshold=0.6,
         prefetch_size=1,
         min_gpu_memory_mb=4096,
-        enable_profiling=True
+        enable_profiling=True,
+        verbose=True  # Enable verbose logging to see chunk details
     )
     
     # Wrap with Overflow
     print("\nStep 3: Wrapping model with Overflow...")
     start_time = time.time()
     
-    # Initialize strategy tracking
-    actual_strategy = strategy
-    used_chunk_size = 1
-    
     try:
-        if strategy == "auto":
-            # Use automatic optimization
-            wrapped_model = create_auto_optimized_wrapper(model, config)
-            used_chunk_size = getattr(wrapped_model, '_chunk_size', 1)
-            actual_strategy = getattr(wrapped_model, '_optimized_mode', 'unknown')
-            print(f"✓ Auto-selected strategy: {actual_strategy}")
-        else:
-            # Manual strategy selection
-            wrapped_model = DynamicMemoryModule(model, config)
-            
-            if wrapped_model.strategy != ExecutionStrategy.CPU_OFFLOAD:
-                print(f"\n⚠️  Warning: Expected CPU_OFFLOAD strategy but got {wrapped_model.strategy.value}")
-            
-            # Apply chunked offloading if requested
-            if strategy == "chunked":
-                print("\nStep 3.5: Applying chunked offloading optimization...")
-                wrapped_model, used_chunk_size = add_chunked_offloading(wrapped_model, chunk_size)
-            else:
-                print(f"\n📋 Sequential Offloading (Default):")
-                print(f"  - Processing 1 layer at a time")
-                print(f"  - Expected swaps: {len(model.layers) * 2}")
-                used_chunk_size = 1
-                actual_strategy = "sequential"
+        # Let Overflow handle everything automatically
+        wrapped_model = DynamicMemoryModule(model, config)
         
         wrap_time = time.time() - start_time
         print(f"✓ Model wrapped in {wrap_time:.1f} seconds")
+        print(f"✓ Strategy selected: {wrapped_model.strategy.value}")
+        
+        # Get strategy information
+        strategy_info = wrapped_model.get_strategy_info()
+        print(f"\n📊 Strategy Details:")
+        print(f"  - Model size: {strategy_info['model_size_gb']:.1f} GB")
+        print(f"  - Total GPU memory: {strategy_info['total_gpu_memory_gb']:.1f} GB")
+        if 'single_gpu_memory_gb' in strategy_info:
+            print(f"  - Single GPU memory: {strategy_info['single_gpu_memory_gb']:.1f} GB")
+        print(f"  - Number of GPUs: {strategy_info['gpu_count']}")
+        
+        # Check if chunked offloading was automatically applied
+        if wrapped_model.strategy == ExecutionStrategy.CPU_OFFLOAD:
+            # The framework will have automatically applied chunked offloading if beneficial
+            print("\n📋 CPU Offloading Details:")
+            if strategy_info.get('uses_chunked_offloading', False):
+                print("  → Using optimized chunked CPU offloading")
+                print("  → The framework will optimize chunk size based on input dimensions")
+            else:
+                print("  → Using sequential CPU offloading")
+                print("  → Processing one layer at a time")
         
     except Exception as e:
         print(f"✗ Failed to wrap model: {str(e)}")
@@ -402,6 +248,15 @@ def run_60gb_model_test(strategy="sequential", chunk_size=None):
         
         # Get final statistics
         final_stats = wrapped_model.get_memory_stats()
+        
+        # Show chunk information if available
+        if 'chunk_info' in final_stats:
+            print(f"\n📊 Chunk Optimization Details:")
+            print(f"  - Chunk size: {final_stats['chunk_info']['chunk_size']} layers")
+            print(f"  - Number of chunks: {final_stats['chunk_info']['num_chunks']}")
+            print(f"  - Layer memory: {final_stats['chunk_info']['layer_memory_mb']:.1f} MB")
+            print(f"  - Expected GPU usage: {final_stats['chunk_info']['expected_gpu_usage_gb']:.1f} GB per GPU")
+        
         total_swaps_out = final_stats['swap_stats']['swaps_out'] - swap_start_count_out
         total_swaps_in = final_stats['swap_stats']['swaps_in'] - swap_start_count_in
         
@@ -436,10 +291,14 @@ def run_60gb_model_test(strategy="sequential", chunk_size=None):
         print(f"  - Inference throughput: {throughput_gb_per_sec:.3f} GB/s")
         print(f"  - Effective memory multiplication: {model_gb / (final_stats['peak_memory_mb']/1024):.1f}x")
         
-        # Return results for comparison
+        # Tips based on performance
+        if wrapped_model.strategy == ExecutionStrategy.CPU_OFFLOAD and inference_time > 60:
+            print("\n💡 Performance Tips:")
+            print("  - The framework automatically optimizes CPU offloading when possible")
+            print("  - Consider using a smaller model or adding more GPUs for faster inference")
+            print("  - Ensure you're using pinned memory (automatic with Overflow)")
+        
         return {
-            'strategy': actual_strategy,
-            'chunk_size': used_chunk_size,
             'inference_time': inference_time,
             'total_swaps': total_swaps_out + total_swaps_in,
             'peak_gpu_mb': final_stats['peak_memory_mb'],
@@ -465,59 +324,10 @@ def run_60gb_model_test(strategy="sequential", chunk_size=None):
             torch.cuda.empty_cache()
 
 
-def compare_strategies():
-    """Run both strategies and compare results."""
-    print("\n" + "="*70)
-    print("Comparing Sequential vs Chunked CPU Offloading")
-    print("="*70)
-    
-    results = []
-    
-    # Run sequential strategy
-    print("\n🔵 Running Sequential Strategy...")
-    seq_result = run_60gb_model_test(strategy="sequential")
-    if seq_result:
-        results.append(seq_result)
-    
-    # Clean up between runs
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    time.sleep(5)  # Give system time to recover
-    
-    # Run chunked strategy
-    print("\n\n🟢 Running Chunked Strategy...")
-    chunk_result = run_60gb_model_test(strategy="chunked")
-    if chunk_result:
-        results.append(chunk_result)
-    
-    # Compare results
-    if len(results) == 2:
-        print("\n\n" + "="*70)
-        print("Performance Comparison")
-        print("="*70)
-        
-        seq, chunk = results[0], results[1]
-        speedup = seq['inference_time'] / chunk['inference_time']
-        
-        print(f"\n{'Metric':<30} {'Sequential':<20} {'Chunked':<20} {'Improvement':<20}")
-        print("-"*90)
-        print(f"{'Inference Time (s)':<30} {seq['inference_time']:<20.1f} {chunk['inference_time']:<20.1f} {speedup:<20.1f}x faster")
-        print(f"{'Total Swaps':<30} {seq['total_swaps']:<20} {chunk['total_swaps']:<20} {seq['total_swaps']/chunk['total_swaps']:<20.1f}x fewer")
-        print(f"{'Peak GPU Memory (MB)':<30} {seq['peak_gpu_mb']:<20.1f} {chunk['peak_gpu_mb']:<20.1f} {chunk['peak_gpu_mb']/seq['peak_gpu_mb']:<20.1f}x more")
-        print(f"{'Throughput (GB/s)':<30} {seq['throughput_gb_s']:<20.3f} {chunk['throughput_gb_s']:<20.3f} {speedup:<20.1f}x higher")
-        
-        print("\n🎯 Key Insights:")
-        print(f"  - Chunked offloading is {speedup:.1f}x faster")
-        print(f"  - Uses {chunk['peak_gpu_mb']/seq['peak_gpu_mb']:.0f}x more GPU memory (still safe)")
-        print(f"  - Reduces swaps by {(1 - chunk['total_swaps']/seq['total_swaps'])*100:.0f}%")
-        print(f"  - Better GPU utilization: {chunk['peak_gpu_mb']/1024:.1f}GB vs {seq['peak_gpu_mb']/1024:.1f}GB")
-
-
 def quick_test_smaller_model():
     """Quick test with a smaller model for systems with limited RAM."""
     print("\n" + "="*70)
-    print("Quick Test with Smaller Model (Auto-Optimized)")
+    print("Quick Test with Smaller Model")
     print("="*70)
     
     print("\nCreating a 1GB model for quick testing...")
@@ -538,17 +348,10 @@ def quick_test_smaller_model():
     model_size_gb = (total_params * 4) / 1024**3
     print(f"Model size: {model_size_gb:.2f} GB ({total_params:,} parameters)")
     
-    # Wrap with Overflow using automatic optimization
-    print("\nWrapping with Overflow (automatic optimization)...")
-    wrapped = create_auto_optimized_wrapper(model)
+    # Wrap with Overflow
+    print("\nWrapping with Overflow...")
+    wrapped = DynamicMemoryModule(model)
     print(f"✓ Strategy selected: {wrapped.strategy.value}")
-    
-    # Show optimization details
-    if hasattr(wrapped, '_optimized_mode'):
-        if wrapped._optimized_mode == "chunked":
-            print(f"✓ Auto-optimization: Using chunked offloading with {wrapped._chunk_size} layers/chunk")
-        elif wrapped._optimized_mode == "sequential":
-            print("✓ Auto-optimization: Using sequential offloading (optimal for this config)")
     
     # Explain the strategy
     if wrapped.strategy == ExecutionStrategy.STANDARD:
@@ -557,6 +360,7 @@ def quick_test_smaller_model():
         print("  → Using gradient checkpointing to save memory")
     elif wrapped.strategy == ExecutionStrategy.CPU_OFFLOAD:
         print("  → Using CPU offloading (model larger than GPU)")
+        print("  → The framework will automatically optimize the offloading strategy")
     
     # Run inference
     print("\nRunning quick inference test...")
@@ -598,18 +402,6 @@ def main():
         action="store_true", 
         help="Force run even with insufficient RAM (not recommended)"
     )
-    parser.add_argument(
-        "--strategy",
-        choices=["sequential", "chunked", "compare", "auto"],
-        default="auto",
-        help="CPU offloading strategy to use (default: auto)"
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=None,
-        help="Chunk size for chunked strategy (default: auto-calculate)"
-    )
     
     args = parser.parse_args()
     
@@ -627,22 +419,22 @@ def main():
             print("  2. Run with --quick for a smaller model test")
             print("  3. Run with --force to attempt anyway (may crash)")
         else:
-            if args.strategy == "compare":
-                compare_strategies()
-            else:
-                run_60gb_model_test(strategy=args.strategy, chunk_size=args.chunk_size)
+            # Run the 60GB model test
+            result = run_60gb_model_test()
             
-            if args.strategy == "sequential":
-                print("\n💡 Tips:")
-                print("   1. Try automatic optimization (recommended):")
-                print("      python examples/test_60gb_model.py --strategy auto")
-                print("   2. Try chunked strategy for better performance:")
-                print("      python examples/test_60gb_model.py --strategy chunked")
-                print("   3. Compare all strategies:")
-                print("      python examples/test_60gb_model.py --strategy compare")
-            elif args.strategy == "chunked":
-                print("\n💡 Tip: Try automatic optimization:")
-                print("   python examples/test_60gb_model.py --strategy auto")
+            if result:
+                print("\n" + "="*70)
+                print("Summary")
+                print("="*70)
+                print("✅ Successfully ran a 60GB model on your hardware!")
+                print("\nKey achievements:")
+                print(f"  - Model size: 60GB")
+                print(f"  - Peak GPU memory used: {result['peak_gpu_mb']/1024:.1f}GB")
+                print(f"  - Time taken: {result['inference_time']:.1f}s")
+                if result['total_swaps'] > 0:
+                    print(f"  - CPU-GPU swaps: {result['total_swaps']}")
+                    print("\nThe framework automatically optimized the CPU offloading strategy")
+                    print("to maximize performance while working within your hardware limits.")
 
 
 if __name__ == "__main__":

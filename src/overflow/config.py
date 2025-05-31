@@ -33,3 +33,6 @@ class MemoryConfig:
     cpu_offload_chunk_size: int = 0  # 0 = auto-calculate, >0 = fixed chunk size
     cpu_offload_gpu_percent: float = 0.8  # Use this % of GPU memory for chunks
     cpu_offload_overlap: bool = True  # Overlap CPU-GPU transfers when possible
+    
+    # Debug/Verbose mode
+    verbose: bool = False  # Enable detailed logging for debugging
